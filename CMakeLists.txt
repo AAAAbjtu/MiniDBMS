@@ -10,6 +10,26 @@ if(MSVC)
     add_compile_options(/utf-8 /W3)
 endif()
 
+# ---- Dependencies (header-only) ----
+include(FetchContent)
+
+# cpp-httplib: lightweight HTTP server
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.14.3
+    GIT_SHALLOW    ON
+)
+FetchContent_MakeAvailable(httplib)
+
+# nlohmann/json: JSON for Modern C++
+FetchContent_Declare(json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    ON
+)
+FetchContent_MakeAvailable(json)
+# ---- End Dependencies ----
+
 # Console application
 add_executable(MiniDB
     main.cpp
@@ -19,6 +39,7 @@ add_executable(MiniDB
     FileManager.cpp
     Parser.cpp
     Executor.cpp
+    ApiServer.cpp
 )
 
 # Headers for IDE integration
@@ -31,6 +52,13 @@ target_sources(MiniDB PRIVATE
     FileManager.h
     Parser.h
     Executor.h
+    ApiServer.h
+)
+
+# Link header-only libraries
+target_link_libraries(MiniDB PRIVATE
+    httplib::httplib
+    nlohmann_json::nlohmann_json
 )
 
 # MinGW: link runtime libraries statically for a self-contained exe
@@ -42,6 +70,7 @@ target_compile_definitions(MiniDB PRIVATE
     $<$<CONFIG:Debug>:_DEBUG>
     $<$<CONFIG:Release>:NDEBUG>
     _CONSOLE
+    WEB_ROOT="${CMAKE_SOURCE_DIR}/web"
 )
 
 # Use folders in IDE

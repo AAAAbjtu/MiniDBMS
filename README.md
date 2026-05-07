@@ -45,6 +45,24 @@ SHOW GRANTS FOR user1;
 SHOW AUDIT LOG;
 ```
 
+## Web GUI / Web 界面
+
+启动 Web 服务器模式，通过浏览器操作数据库：
+
+```bash
+# 默认端口 3000
+./MiniDB --web
+
+# 自定义端口
+./MiniDB --web --port 3000
+```
+
+然后在浏览器打开 `http://localhost:3000` 即可使用图形界面。
+
+- 首次登录会自动创建管理员账户（无需预先注册）
+- 支持多个浏览器标签页独立会话
+- 提供数据库浏览器、SQL 编辑器、查询历史等功能
+
 ## Notes
 
 - 数据目录：`data_<库名>/`，表文件：`*.tbl`（V2 二进制格式，带魔数 `MINIDB` + `0x02`）

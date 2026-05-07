@@ -43,6 +43,9 @@ public:
      * 构造函数
      */
     Executor();
+
+    const std::string& getCurrentUser() const { return currentUser; }
+    const std::string& getCurrentDb()   const { return currentDb; }
     
     /**
      * 执行 SQL 语句
