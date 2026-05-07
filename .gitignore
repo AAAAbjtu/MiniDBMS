@@ -1,0 +1,29 @@
+# CMake build directory
+build/
+cmake-build-*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Compiled output
+*.exe
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+
+# Libraries
+*.lib
+*.a
+*.dylib
+
+# Debug symbol files
+*.dsym/
