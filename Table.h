@@ -2,6 +2,7 @@
 #define TABLE_H
 
 #include "Record.h"
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -119,11 +120,40 @@ public:
     const std::vector<Record>& getRecords() const;
     
     /**
-     * 添加列
-     * @param columnName 列名
-     * @param type 列类型
+     * 主键列索引，无则 -1
      */
-    void addColumn(const std::string& columnName, SqlType type);
+    int primaryKeyColumnIndex() const;
+
+    /**
+     * 当前所有行的主键值是否两两不同（无主键时视为 true）
+     */
+    bool primaryKeyUniqueAmongRows() const;
+
+    /**
+     * PRIMARY KEY 与 UNIQUE 列在现有行中是否两两满足唯一性
+     */
+    bool allUniqueConstraintsAmongRows() const;
+
+    /**
+     * 候选行是否与已有行在某 PRIMARY KEY / UNIQUE 列上冲突
+     */
+    bool rowConflictsUniqueKeys(const Record& candidate, size_t excludeRowIndex, std::string& errMsg) const;
+
+    /**
+     * 候选行是否与已有行主键冲突
+     * @param excludeRowIndex 排除的行下标；(size_t)-1 表示不排除任何行
+     */
+    bool conflictsPrimaryKey(const Record& candidate, size_t excludeRowIndex) const;
+
+    /**
+     * 匹配 WHERE 单列等值的行下标（whereColumn 为空则全部行）
+     */
+    std::vector<size_t> matchingRowIndices(const std::string& whereColumn, const std::string& whereValue) const;
+
+    /**
+     * 添加列（含 NOT NULL / PRIMARY KEY 元数据）
+     */
+    void addColumn(const ColumnDef& col);
     
     /**
      * 删除列

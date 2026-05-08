@@ -5,10 +5,12 @@
 
 #include "Executor.h"
 #include "Ast.h"
+#include "Constraints.h"
 #include "Schema.h"
 #include <iostream>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -23,7 +25,6 @@ static bool buildInsertRecord(Table& t, const ast::InsertStmt& ins, Record& out,
         return false;
     }
     out.cells.resize(sch.size());
-    // 初始化默认值
     for (size_t i = 0; i < sch.size(); ++i) {
         switch (sch[i].type) {
         case SqlType::Int:
@@ -38,11 +39,15 @@ static bool buildInsertRecord(Table& t, const ast::InsertStmt& ins, Record& out,
         }
     }
     if (!ins.columns.empty()) {
-        // 处理指定列插入
-        for (size_t i = 0; i < ins.columns.size() && i < ins.values.size(); ++i) {
+        if (ins.columns.size() != ins.values.size()) {
+            err = "指定列与值数量不一致";
+            return false;
+        }
+        for (size_t i = 0; i < ins.columns.size(); ++i) {
             int idx = t.columnIndex(ins.columns[i]);
             if (idx < 0) {
-                continue;
+                err = "未知列: " + ins.columns[i];
+                return false;
             }
             auto c = parseLiteralToCell(ins.values[i], sch[static_cast<size_t>(idx)].type);
             if (!c.has_value()) {
@@ -53,7 +58,6 @@ static bool buildInsertRecord(Table& t, const ast::InsertStmt& ins, Record& out,
         }
         return true;
     }
-    // 处理全列插入
     if (ins.values.size() != sch.size()) {
         err = "列数与值数量不一致";
         return false;
@@ -65,6 +69,199 @@ static bool buildInsertRecord(Table& t, const ast::InsertStmt& ins, Record& out,
             return false;
         }
         out.cells[i] = *c;
+    }
+    return true;
+}
+
+static bool insertColumnListed(const ast::InsertStmt& ins, const std::string& colName) {
+    for (const auto& c : ins.columns) {
+        if (c == colName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool validateChildForeignKeys(Executor& ex, const std::string& db, const Table& child, const Record& row,
+                                     std::string& err) {
+    const auto& sch = child.getSchema();
+    for (size_t i = 0; i < sch.size(); ++i) {
+        if (sch[i].fkRefTable.empty()) {
+            continue;
+        }
+        if (i >= row.cells.size()) {
+            continue;
+        }
+        Table& parent = ex.loadTable(sch[i].fkRefTable);
+        if (!parentHasMatchingKeyValue(parent, sch[i].fkRefCol, row.cells[i])) {
+            err = "违反外键：列 " + sch[i].name + " 的值在被引用表中不存在";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool canDeleteParentRows(Executor& ex, const std::string& db, Table& parent, const ast::DeleteStmt& s,
+                                std::string& err) {
+    std::vector<IncomingForeignKey> incoming = FileManager::listIncomingForeignKeys(db, parent.getName());
+    if (incoming.empty()) {
+        return true;
+    }
+    std::vector<size_t> rows = parent.matchingRowIndices(s.whereColumn, s.whereValue);
+    for (size_t ri : rows) {
+        const Record& pr = parent.getRecords()[ri];
+        for (const auto& fk : incoming) {
+            int pidx = parent.columnIndex(fk.parentReferencedColumn);
+            if (pidx < 0 || pidx >= static_cast<int>(pr.cells.size())) {
+                continue;
+            }
+            const Cell& v = pr.cells[static_cast<size_t>(pidx)];
+            Table& child = ex.loadTable(fk.childTable);
+            int cidx = child.columnIndex(fk.childFkColumn);
+            if (cidx < 0) {
+                continue;
+            }
+            SqlType ct = child.columnType(cidx);
+            for (const auto& cr : child.getRecords()) {
+                if (cidx < static_cast<int>(cr.cells.size()) &&
+                    cellEqualsTyped(cr.cells[static_cast<size_t>(cidx)], v, ct)) {
+                    err = "存在子表外键引用，拒绝删除";
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * NOT NULL / CHECK / 外键 / 唯一性（插入）
+ */
+static bool validateInsertIntegrity(Executor& ex, const std::string& db, const Table& t, const ast::InsertStmt& ins,
+                                    const Record& row, std::string& err) {
+    const auto& sch = t.getSchema();
+    if (!ins.columns.empty()) {
+        for (size_t i = 0; i < sch.size(); ++i) {
+            if (sch[i].notNull && !insertColumnListed(ins, sch[i].name)) {
+                err = "违反 NOT NULL：未为列 " + sch[i].name + " 提供值";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < sch.size(); ++i) {
+        if (!sch[i].notNull && !sch[i].primaryKey) {
+            continue;
+        }
+        if (i >= row.cells.size()) {
+            err = "行数据与表结构不一致";
+            return false;
+        }
+        if (cellViolatesNotNull(row.cells[i], sch[i].type)) {
+            err = sch[i].primaryKey ? "主键列不能为空字符串" : ("违反 NOT NULL：列 " + sch[i].name);
+            return false;
+        }
+    }
+    if (!evaluateAllCheckConstraints(sch, row, err)) {
+        return false;
+    }
+    if (!validateChildForeignKeys(ex, db, t, row, err)) {
+        return false;
+    }
+    constexpr size_t kNoExclude = static_cast<size_t>(-1);
+    if (t.rowConflictsUniqueKeys(row, kNoExclude, err)) {
+        return false;
+    }
+    return true;
+}
+
+static bool validateUpdateIntegrity(Executor& ex, const std::string& db, Table& t, const ast::UpdateStmt& s,
+                                    std::string& err) {
+    int setIdx = t.columnIndex(s.setColumn);
+    if (setIdx < 0) {
+        err = "列不存在: " + s.setColumn;
+        return false;
+    }
+    SqlType st = t.columnType(setIdx);
+    auto newCell = parseLiteralToCell(s.setValue, st);
+    if (!newCell.has_value()) {
+        err = "SET 值与列类型不匹配";
+        return false;
+    }
+    const auto& sch = t.getSchema();
+    const ColumnDef& cd = sch[static_cast<size_t>(setIdx)];
+    if ((cd.notNull || cd.primaryKey) && cellViolatesNotNull(*newCell, st)) {
+        err = cd.primaryKey ? "主键列不能为空字符串" : "违反 NOT NULL";
+        return false;
+    }
+    std::vector<size_t> matched = t.matchingRowIndices(s.whereColumn, s.whereValue);
+
+    if (cd.primaryKey || cd.unique) {
+        if (matched.size() > 1) {
+            err = "不能将多行更新为相同的唯一键值";
+            return false;
+        }
+        if (matched.size() == 1) {
+            const auto& recs = t.getRecords();
+            Record temp = recs[matched[0]];
+            if (setIdx >= static_cast<int>(temp.cells.size())) {
+                err = "行数据与表结构不一致";
+                return false;
+            }
+            temp.cells[static_cast<size_t>(setIdx)] = *newCell;
+            if (t.rowConflictsUniqueKeys(temp, matched[0], err)) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<IncomingForeignKey> incoming = FileManager::listIncomingForeignKeys(db, t.getName());
+    for (const auto& fk : incoming) {
+        if (fk.parentReferencedColumn != s.setColumn) {
+            continue;
+        }
+        for (size_t ri : matched) {
+            const Record& oldr = t.getRecords()[ri];
+            if (setIdx >= static_cast<int>(oldr.cells.size())) {
+                continue;
+            }
+            const Cell& oldv = oldr.cells[static_cast<size_t>(setIdx)];
+            if (cellEqualsTyped(oldv, *newCell, st)) {
+                continue;
+            }
+            Table& child = ex.loadTable(fk.childTable);
+            int cidx = child.columnIndex(fk.childFkColumn);
+            if (cidx < 0) {
+                continue;
+            }
+            SqlType ct = child.columnType(cidx);
+            for (const auto& cr : child.getRecords()) {
+                if (cidx < static_cast<int>(cr.cells.size()) &&
+                    cellEqualsTyped(cr.cells[static_cast<size_t>(cidx)], oldv, ct)) {
+                    err = "存在子表外键引用该列旧值，拒绝更新";
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (!cd.fkRefTable.empty()) {
+        Table& parent = ex.loadTable(cd.fkRefTable);
+        if (!parentHasMatchingKeyValue(parent, cd.fkRefCol, *newCell)) {
+            err = "违反外键：SET 值在被引用表中不存在";
+            return false;
+        }
+    }
+
+    for (size_t ri : matched) {
+        Record temp = t.getRecords()[ri];
+        if (setIdx >= static_cast<int>(temp.cells.size())) {
+            err = "行数据与表结构不一致";
+            return false;
+        }
+        temp.cells[static_cast<size_t>(setIdx)] = *newCell;
+        if (!evaluateAllCheckConstraints(sch, temp, err)) {
+            return false;
+        }
     }
     return true;
 }
@@ -291,9 +488,32 @@ void Executor::execute(const ParseResult& pr) {
                     return;
                 }
                 Table& t = loadTable(s.table);
-                std::cout << "Field\tType\n";
+                std::cout << "Field\tType\tConstraints\n";
                 for (const auto& c : t.getSchema()) {
-                    std::cout << c.name << "\t" << sqlTypeToString(c.type) << "\n";
+                    std::cout << c.name << "\t" << sqlTypeToString(c.type) << "\t";
+                    std::vector<std::string> bits;
+                    if (c.primaryKey) {
+                        bits.push_back("PRIMARY KEY");
+                    }
+                    if (c.unique && !c.primaryKey) {
+                        bits.push_back("UNIQUE");
+                    }
+                    if (c.notNull && !c.primaryKey) {
+                        bits.push_back("NOT NULL");
+                    }
+                    if (!c.fkRefTable.empty()) {
+                        bits.push_back("REFERENCES " + c.fkRefTable + "(" + c.fkRefCol + ")");
+                    }
+                    if (!c.checkExpr.empty()) {
+                        bits.push_back("CHECK (" + c.checkExpr + ")");
+                    }
+                    for (size_t bi = 0; bi < bits.size(); ++bi) {
+                        if (bi > 0) {
+                            std::cout << " ";
+                        }
+                        std::cout << bits[bi];
+                    }
+                    std::cout << "\n";
                 }
                 std::cout << "(" << t.getSchema().size() << " columns)\n";
                 FileManager::addAuditLog(currentUser, "DESCRIBE", s.table, "SUCCESS");
@@ -313,6 +533,11 @@ void Executor::execute(const ParseResult& pr) {
                 const auto& s = arg;
                 if (!FileManager::tableExists(currentDb, s.table)) {
                     std::cout << "Table not found: " << s.table << "\n";
+                    return;
+                }
+                if (FileManager::isTableReferencedByForeignKeys(currentDb, s.table)) {
+                    std::cout << "存在外键引用该表，拒绝 DROP TABLE。\n";
+                    FileManager::addAuditLog(currentUser, "DROP TABLE", s.table, "DENIED");
                     return;
                 }
                 if (FileManager::dropTable(currentDb, s.table)) {
@@ -345,11 +570,64 @@ void Executor::execute(const ParseResult& pr) {
                 bool success = false;
                 switch (s.op) {
                 case ast::AlterOperation::AddColumn:
-                    t.addColumn(s.columnName, s.columnType);
-                    success = true;
-                    std::cout << "Column added: " << s.columnName << "\n";
+                    if (t.primaryKeyColumnIndex() >= 0 && s.addPrimaryKey) {
+                        std::cout << "表已有主键列，不能再添加主键列。\n";
+                        break;
+                    }
+                    if (!t.getRecords().empty() && s.addNotNull && s.columnType == SqlType::Text) {
+                        std::cout << "不能向非空表添加 NOT NULL 文本列（无默认值）。\n";
+                        break;
+                    }
+                    {
+                        ColumnDef cd;
+                        cd.name = s.columnName;
+                        cd.type = s.columnType;
+                        cd.notNull = s.addNotNull;
+                        cd.primaryKey = s.addPrimaryKey;
+                        cd.unique = s.addUnique;
+                        cd.checkExpr = s.addCheckExpr;
+                        cd.fkRefTable = s.addFkRefTable;
+                        cd.fkRefCol = s.addFkRefCol;
+                        if (cd.primaryKey) {
+                            cd.notNull = true;
+                        }
+                        std::vector<ColumnDef> schPlus = t.getSchema();
+                        schPlus.push_back(cd);
+                        if (!cd.fkRefTable.empty()) {
+                            std::string fe;
+                            if (!validateForeignKeyDefinition(currentDb, s.table, schPlus, cd.fkRefTable, cd.fkRefCol,
+                                                                fe)) {
+                                std::cout << fe << "\n";
+                                break;
+                            }
+                        }
+                        t.addColumn(cd);
+                        if (!t.allUniqueConstraintsAmongRows()) {
+                            t.dropColumn(s.columnName);
+                            std::cout << "添加列失败：唯一性不满足（与现有数据冲突）。\n";
+                            break;
+                        }
+                        std::string chkErr;
+                        bool chkOk = true;
+                        for (const auto& r : t.getRecords()) {
+                            if (!evaluateAllCheckConstraints(t.getSchema(), r, chkErr)) {
+                                t.dropColumn(s.columnName);
+                                std::cout << chkErr << "\n";
+                                chkOk = false;
+                                break;
+                            }
+                        }
+                        if (chkOk) {
+                            success = true;
+                            std::cout << "Column added: " << s.columnName << "\n";
+                        }
+                    }
                     break;
                 case ast::AlterOperation::DropColumn:
+                    if (FileManager::isParentColumnReferencedByFk(currentDb, s.table, s.columnName)) {
+                        std::cout << "该列被外键引用，拒绝 DROP COLUMN。\n";
+                        break;
+                    }
                     t.dropColumn(s.columnName);
                     success = true;
                     std::cout << "Column dropped: " << s.columnName << "\n";
@@ -385,6 +663,16 @@ void Executor::execute(const ParseResult& pr) {
                     std::cout << "CREATE TABLE requires columns.\n";
                     return;
                 }
+                for (const auto& c : s.columns) {
+                    if (!c.fkRefTable.empty()) {
+                        std::string fe;
+                        if (!validateForeignKeyDefinition(currentDb, s.table, s.columns, c.fkRefTable, c.fkRefCol,
+                                                            fe)) {
+                            std::cout << fe << "\n";
+                            return;
+                        }
+                    }
+                }
                 Table tab(s.table, s.columns);
                 tables[s.table] = std::move(tab);
                 FileManager::save(currentDb, tables[s.table]);
@@ -412,6 +700,10 @@ void Executor::execute(const ParseResult& pr) {
                 Record r;
                 std::string err;
                 if (!buildInsertRecord(t, s, r, err)) {
+                    std::cout << err << "\n";
+                    return;
+                }
+                if (!validateInsertIntegrity(*this, currentDb, t, s, r, err)) {
                     std::cout << err << "\n";
                     return;
                 }
@@ -460,6 +752,11 @@ void Executor::execute(const ParseResult& pr) {
                     return;
                 }
                 Table& t = loadTable(s.table);
+                std::string derr;
+                if (!canDeleteParentRows(*this, currentDb, t, s, derr)) {
+                    std::cout << derr << "\n";
+                    return;
+                }
                 int n = t.deleteRows(s.whereColumn, s.whereValue);
                 FileManager::save(currentDb, t);
                 std::cout << n << " rows deleted.\n";
@@ -483,6 +780,11 @@ void Executor::execute(const ParseResult& pr) {
                     return;
                 }
                 Table& t = loadTable(s.table);
+                std::string uerr;
+                if (!validateUpdateIntegrity(*this, currentDb, t, s, uerr)) {
+                    std::cout << uerr << "\n";
+                    return;
+                }
                 int n = t.updateRows(s.setColumn, s.setValue, s.whereColumn, s.whereValue);
                 FileManager::save(currentDb, t);
                 std::cout << n << " rows updated.\n";

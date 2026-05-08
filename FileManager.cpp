@@ -85,6 +85,46 @@ static const unsigned char kMagicV1[8] = {'M', 'I', 'N', 'I', 'D', 'B', 0x01, 0x
  * V2 格式魔数：MINIDB + 0x02
  */
 static const unsigned char kMagicV2[8] = {'M', 'I', 'N', 'I', 'D', 'B', 0x02, 0x00};
+/**
+ * V3 格式魔数：MINIDB + 0x03（列定义含 NOT NULL / PRIMARY KEY 标志）
+ */
+static const unsigned char kMagicV3[8] = {'M', 'I', 'N', 'I', 'D', 'B', 0x03, 0x00};
+/**
+ * V4：在 V3 基础上增加 UNIQUE / CHECK / REFERENCES 元数据
+ */
+static const unsigned char kMagicV4[8] = {'M', 'I', 'N', 'I', 'D', 'B', 0x04, 0x00};
+
+/** bit0 NOT NULL, bit1 PRIMARY KEY, bit2 UNIQUE, bit8 FK 载荷, bit16 CHECK 载荷 */
+static std::uint8_t columnFlagsByteV4(const ColumnDef& c) {
+    std::uint8_t f = 0;
+    if (c.notNull) {
+        f |= 1u;
+    }
+    if (c.primaryKey) {
+        f |= 2u;
+    }
+    if (c.unique) {
+        f |= 4u;
+    }
+    if (!c.fkRefTable.empty()) {
+        f |= 8u;
+    }
+    if (!c.checkExpr.empty()) {
+        f |= 16u;
+    }
+    return f;
+}
+
+static void applyColumnFlagsV3(ColumnDef& cd, std::uint8_t f) {
+    cd.notNull = (f & 1u) != 0;
+    cd.primaryKey = (f & 2u) != 0;
+}
+
+static void applyColumnFlagsV4(ColumnDef& cd, std::uint8_t f) {
+    cd.notNull = (f & 1u) != 0;
+    cd.primaryKey = (f & 2u) != 0;
+    cd.unique = (f & 4u) != 0;
+}
 
 /**
  * 写入 32 位无符号整数（小端序）
@@ -354,6 +394,96 @@ static Table loadBinaryV2(std::istream& in, const std::string& tableName) {
     return t;
 }
 
+/**
+ * 加载 V3 二进制格式表
+ * 格式：魔数 + 列数 + (列名+类型标签+flags)列表 + 行数 + 数据
+ */
+static Table loadBinaryV3(std::istream& in, const std::string& tableName) {
+    Table t(tableName);
+    std::uint32_t ncols = readU32(in);
+    if (ncols > 65536) {
+        return t;
+    }
+    std::vector<ColumnDef> schema;
+    schema.reserve(ncols);
+    for (std::uint32_t i = 0; i < ncols; ++i) {
+        ColumnDef cd;
+        cd.name = readString(in);
+        unsigned char tag = 0;
+        in.read(reinterpret_cast<char*>(&tag), 1);
+        if (in.gcount() != 1) {
+            return t;
+        }
+        cd.type = tagType(tag);
+        unsigned char flags = 0;
+        in.read(reinterpret_cast<char*>(&flags), 1);
+        if (in.gcount() != 1) {
+            return t;
+        }
+        applyColumnFlagsV3(cd, static_cast<std::uint8_t>(flags & 3u));
+        schema.push_back(std::move(cd));
+    }
+    t.setSchema(schema);
+    std::uint32_t nrows = readU32(in);
+    const auto& sch = t.getSchema();
+    for (std::uint32_t r = 0; r < nrows; ++r) {
+        Record rec;
+        for (std::uint32_t i = 0; i < ncols; ++i) {
+            rec.cells.push_back(readCell(in, sch[i].type));
+        }
+        t.insert(rec);
+    }
+    return t;
+}
+
+/**
+ * 加载 V4 二进制格式表
+ */
+static Table loadBinaryV4(std::istream& in, const std::string& tableName) {
+    Table t(tableName);
+    std::uint32_t ncols = readU32(in);
+    if (ncols > 65536) {
+        return t;
+    }
+    std::vector<ColumnDef> schema;
+    schema.reserve(ncols);
+    for (std::uint32_t i = 0; i < ncols; ++i) {
+        ColumnDef cd;
+        cd.name = readString(in);
+        unsigned char tag = 0;
+        in.read(reinterpret_cast<char*>(&tag), 1);
+        if (in.gcount() != 1) {
+            return t;
+        }
+        cd.type = tagType(tag);
+        unsigned char flags = 0;
+        in.read(reinterpret_cast<char*>(&flags), 1);
+        if (in.gcount() != 1) {
+            return t;
+        }
+        applyColumnFlagsV4(cd, flags);
+        if ((flags & 8u) != 0) {
+            cd.fkRefTable = readString(in);
+            cd.fkRefCol = readString(in);
+        }
+        if ((flags & 16u) != 0) {
+            cd.checkExpr = readString(in);
+        }
+        schema.push_back(std::move(cd));
+    }
+    t.setSchema(schema);
+    std::uint32_t nrows = readU32(in);
+    const auto& sch = t.getSchema();
+    for (std::uint32_t r = 0; r < nrows; ++r) {
+        Record rec;
+        for (std::uint32_t i = 0; i < ncols; ++i) {
+            rec.cells.push_back(readCell(in, sch[i].type));
+        }
+        t.insert(rec);
+    }
+    return t;
+}
+
 } // namespace
 
 /**
@@ -447,7 +577,7 @@ bool FileManager::dropTable(const std::string& dbName, const std::string& tableN
 void FileManager::save(const std::string& dbName, const Table& table) {
     ensureDatabase(dbName);
     std::ofstream file(tableFile(dbName, table.getName()), std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(kMagicV2), 8);
+    file.write(reinterpret_cast<const char*>(kMagicV4), 8);
     const auto& sch = table.getSchema();
     std::uint32_t ncols = static_cast<std::uint32_t>(sch.size());
     writeU32(file, ncols);
@@ -455,6 +585,15 @@ void FileManager::save(const std::string& dbName, const Table& table) {
         writeString(file, c.name);
         unsigned char tag = typeTag(c.type);
         file.put(static_cast<char>(tag));
+        std::uint8_t fb = columnFlagsByteV4(c);
+        file.put(static_cast<char>(fb));
+        if (!c.fkRefTable.empty()) {
+            writeString(file, c.fkRefTable);
+            writeString(file, c.fkRefCol);
+        }
+        if (!c.checkExpr.empty()) {
+            writeString(file, c.checkExpr);
+        }
     }
     const auto& recs = table.getRecords();
     writeU32(file, static_cast<std::uint32_t>(recs.size()));
@@ -497,6 +636,12 @@ Table FileManager::load(const std::string& dbName, const std::string& tableName)
     char head[8];
     file.read(head, 8);
     if (file.gcount() == 8) {
+        if (std::memcmp(head, kMagicV4, 8) == 0) {
+            return loadBinaryV4(file, tableName);
+        }
+        if (std::memcmp(head, kMagicV3, 8) == 0) {
+            return loadBinaryV3(file, tableName);
+        }
         if (std::memcmp(head, kMagicV2, 8) == 0) {
             return loadBinaryV2(file, tableName);
         }
@@ -900,4 +1045,36 @@ std::vector<AuditLogEntry> FileManager::getAuditLogs() {
     }
 
     return logs;
+}
+
+std::vector<IncomingForeignKey> FileManager::listIncomingForeignKeys(const std::string& dbName,
+                                                                     const std::string& parentTable) {
+    std::vector<IncomingForeignKey> out;
+    for (const std::string& tn : listTables(dbName)) {
+        Table t = load(dbName, tn);
+        for (const auto& col : t.getSchema()) {
+            if (!col.fkRefTable.empty() && col.fkRefTable == parentTable) {
+                IncomingForeignKey e;
+                e.childTable = tn;
+                e.childFkColumn = col.name;
+                e.parentReferencedColumn = col.fkRefCol;
+                out.push_back(std::move(e));
+            }
+        }
+    }
+    return out;
+}
+
+bool FileManager::isParentColumnReferencedByFk(const std::string& dbName, const std::string& parentTable,
+                                                const std::string& parentColumn) {
+    for (const auto& e : listIncomingForeignKeys(dbName, parentTable)) {
+        if (e.parentReferencedColumn == parentColumn) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FileManager::isTableReferencedByForeignKeys(const std::string& dbName, const std::string& parentTable) {
+    return !listIncomingForeignKeys(dbName, parentTable).empty();
 }

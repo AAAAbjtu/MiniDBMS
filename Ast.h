@@ -121,6 +121,13 @@ struct AlterTableStmt {
     AlterOperation op;      // 操作类型
     std::string columnName; // 列名
     SqlType columnType;     // 列类型
+    /** 仅 ADD 列时有效：NOT NULL / PRIMARY KEY / UNIQUE / CHECK / REFERENCES */
+    bool addNotNull = false;
+    bool addPrimaryKey = false;
+    bool addUnique = false;
+    std::string addCheckExpr;
+    std::string addFkRefTable;
+    std::string addFkRefCol;
 };
 
 /**

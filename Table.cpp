@@ -5,6 +5,7 @@
 
 #include "Table.h"
 #include <algorithm>
+#include <cstddef>
 
 /**
  * 默认构造函数
@@ -74,6 +75,93 @@ SqlType Table::columnType(int idx) const {
     return schema_[idx].type;
 }
 
+int Table::primaryKeyColumnIndex() const {
+    for (size_t i = 0; i < schema_.size(); ++i) {
+        if (schema_[i].primaryKey) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+bool Table::allUniqueConstraintsAmongRows() const {
+    for (size_t ci = 0; ci < schema_.size(); ++ci) {
+        if (!schema_[ci].primaryKey && !schema_[ci].unique) {
+            continue;
+        }
+        SqlType t = columnType(static_cast<int>(ci));
+        for (size_t i = 0; i < records.size(); ++i) {
+            if (ci >= records[i].cells.size()) {
+                continue;
+            }
+            const Cell& a = records[i].cells[ci];
+            for (size_t j = i + 1; j < records.size(); ++j) {
+                if (ci >= records[j].cells.size()) {
+                    continue;
+                }
+                const Cell& b = records[j].cells[ci];
+                if (cellEqualsTyped(a, b, t)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool Table::primaryKeyUniqueAmongRows() const {
+    return allUniqueConstraintsAmongRows();
+}
+
+bool Table::rowConflictsUniqueKeys(const Record& candidate, size_t excludeRowIndex, std::string& errMsg) const {
+    constexpr size_t kNoExclude = static_cast<size_t>(-1);
+    for (size_t ci = 0; ci < schema_.size(); ++ci) {
+        if (!schema_[ci].primaryKey && !schema_[ci].unique) {
+            continue;
+        }
+        if (ci >= candidate.cells.size()) {
+            continue;
+        }
+        const Cell& v = candidate.cells[ci];
+        SqlType t = columnType(static_cast<int>(ci));
+        for (size_t ri = 0; ri < records.size(); ++ri) {
+            if (excludeRowIndex != kNoExclude && ri == excludeRowIndex) {
+                continue;
+            }
+            if (ci >= records[ri].cells.size()) {
+                continue;
+            }
+            if (cellEqualsTyped(records[ri].cells[ci], v, t)) {
+                errMsg = schema_[ci].primaryKey ? "违反主键唯一性" : ("违反 UNIQUE 列 " + schema_[ci].name);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Table::conflictsPrimaryKey(const Record& candidate, size_t excludeRowIndex) const {
+    int pk = primaryKeyColumnIndex();
+    if (pk < 0 || pk >= static_cast<int>(candidate.cells.size())) {
+        return false;
+    }
+    SqlType pkType = columnType(pk);
+    const Cell& v = candidate.cells[static_cast<size_t>(pk)];
+    constexpr size_t kExcludeNone = static_cast<size_t>(-1);
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (excludeRowIndex != kExcludeNone && i == excludeRowIndex) {
+            continue;
+        }
+        if (pk >= static_cast<int>(records[i].cells.size())) {
+            continue;
+        }
+        if (cellEqualsTyped(records[i].cells[static_cast<size_t>(pk)], v, pkType)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * 插入记录
  * @param r 记录对象
@@ -97,6 +185,28 @@ static bool rowMatchesWhere(const Record& r, int idx, SqlType colType, const std
         return false;
     }
     return cellEqualsTyped(r.cells[idx], *rhs, colType);
+}
+
+std::vector<size_t> Table::matchingRowIndices(const std::string& whereColumn, const std::string& whereValue) const {
+    std::vector<size_t> idxs;
+    if (whereColumn.empty()) {
+        idxs.reserve(records.size());
+        for (size_t i = 0; i < records.size(); ++i) {
+            idxs.push_back(i);
+        }
+        return idxs;
+    }
+    int widx = columnIndex(whereColumn);
+    if (widx < 0) {
+        return idxs;
+    }
+    SqlType wt = columnType(widx);
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (rowMatchesWhere(records[i], widx, wt, whereValue)) {
+            idxs.push_back(i);
+        }
+    }
+    return idxs;
 }
 
 /**
@@ -197,13 +307,13 @@ const std::vector<Record>& Table::getRecords() const { return records; }
  * @param columnName 列名
  * @param type 列类型
  */
-void Table::addColumn(const std::string& columnName, SqlType type) {
-    if (columnIndex(columnName) >= 0) {
+void Table::addColumn(const ColumnDef& col) {
+    if (columnIndex(col.name) >= 0) {
         return;
     }
-    schema_.push_back({columnName, type});
+    schema_.push_back(col);
     for (auto& r : records) {
-        switch (type) {
+        switch (col.type) {
         case SqlType::Int:
             r.cells.push_back(Cell{static_cast<std::int64_t>(0)});
             break;

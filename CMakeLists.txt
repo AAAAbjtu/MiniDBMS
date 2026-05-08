@@ -16,6 +16,7 @@ add_executable(MiniDB
     MiniDB.cpp
     Schema.cpp
     Table.cpp
+    Constraints.cpp
     FileManager.cpp
     Parser.cpp
     Executor.cpp
@@ -31,6 +32,7 @@ target_sources(MiniDB PRIVATE
     FileManager.h
     Parser.h
     Executor.h
+    Constraints.h
 )
 
 # MinGW: link runtime libraries statically for a self-contained exe

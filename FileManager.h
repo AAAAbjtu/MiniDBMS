@@ -6,6 +6,15 @@
 #include <vector>
 
 /**
+ * 其他表指向本表的外键边（用于 RESTRICT 删除/改表）
+ */
+struct IncomingForeignKey {
+    std::string childTable;
+    std::string childFkColumn;
+    std::string parentReferencedColumn;
+};
+
+/**
  * 用户信息结构体
  */
 struct UserInfo {
@@ -91,6 +100,23 @@ public:
      * @return 表对象
      */
     static Table load(const std::string& dbName, const std::string& tableName);
+
+    /**
+     * 列出所有指向 parentTable 的外键（扫描库内各表结构）
+     */
+    static std::vector<IncomingForeignKey> listIncomingForeignKeys(const std::string& dbName,
+                                                                   const std::string& parentTable);
+
+    /**
+     * 是否存在外键引用 parentTable 的某一列
+     */
+    static bool isParentColumnReferencedByFk(const std::string& dbName, const std::string& parentTable,
+                                             const std::string& parentColumn);
+
+    /**
+     * 是否存在外键指向 parentTable（任意列）
+     */
+    static bool isTableReferencedByForeignKeys(const std::string& dbName, const std::string& parentTable);
 
     /**
      * 创建用户

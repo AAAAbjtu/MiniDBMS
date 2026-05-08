@@ -137,6 +137,14 @@ std::string sqlTypeToString(SqlType t) {
     return "TEXT";
 }
 
+bool cellViolatesNotNull(const Cell& c, SqlType t) {
+    if (t != SqlType::Text) {
+        return false;
+    }
+    const auto* s = std::get_if<std::string>(&c);
+    return !s || s->empty();
+}
+
 /**
  * 同类型相等比较
  * 用于 WHERE 条件的比较运算

@@ -105,6 +105,36 @@ bool lexSql(const std::string& sql, std::vector<Token>& out, std::string& err) {
             ++i;
             continue;
         }
+        if (c == '<') {
+            if (i + 1 < n && sql[i + 1] == '=') {
+                out.push_back({Token::WORD, "<="});
+                i += 2;
+                continue;
+            }
+            if (i + 1 < n && sql[i + 1] == '>') {
+                out.push_back({Token::WORD, "<>"});
+                i += 2;
+                continue;
+            }
+            out.push_back({Token::WORD, "<"});
+            ++i;
+            continue;
+        }
+        if (c == '>') {
+            if (i + 1 < n && sql[i + 1] == '=') {
+                out.push_back({Token::WORD, ">="});
+                i += 2;
+                continue;
+            }
+            out.push_back({Token::WORD, ">"});
+            ++i;
+            continue;
+        }
+        if (c == '!' && i + 1 < n && sql[i + 1] == '=') {
+            out.push_back({Token::WORD, "!="});
+            i += 2;
+            continue;
+        }
         if (c == ',') {
             out.push_back({Token::COMMA, ""});
             ++i;
@@ -223,9 +253,140 @@ bool expectWord(const std::vector<Token>& t, size_t& pos, const char* kw) {
     return true;
 }
 
+/** 将 CHECK 子句中的 Token 还原为 Constraints 模块可解析的文本 */
+std::string tokenToCheckFragment(const Token& tok) {
+    switch (tok.kind) {
+    case Token::WORD:
+        return tok.text;
+    case Token::NUMBER:
+        return tok.text;
+    case Token::STRING: {
+        std::string o = "'";
+        for (char c : tok.text) {
+            if (c == '\'') {
+                o += "''";
+            } else {
+                o += c;
+            }
+        }
+        o += '\'';
+        return o;
+    }
+    case Token::EQ:
+        return "=";
+    case Token::LPAREN:
+        return "(";
+    case Token::RPAREN:
+        return ")";
+    case Token::COMMA:
+        return ",";
+    default:
+        return "";
+    }
+}
+
+std::string serializeCheckExprFromTokens(const std::vector<Token>& t, size_t start, size_t endExclusive) {
+    std::string o;
+    for (size_t j = start; j < endExclusive; ++j) {
+        std::string frag = tokenToCheckFragment(t[j]);
+        if (frag.empty()) {
+            continue;
+        }
+        if (!o.empty()) {
+            o += ' ';
+        }
+        o += frag;
+    }
+    return o;
+}
+
+/**
+ * 解析列上的可选约束：NOT NULL、PRIMARY KEY、UNIQUE、REFERENCES、CHECK（可多次、顺序任意）
+ */
+bool parseColumnPostConstraints(const std::vector<Token>& t, size_t& pos, ColumnDef& col) {
+    while (pos < t.size() && peek(t, pos).kind == Token::WORD) {
+        std::string w = upper(peek(t, pos).text);
+        if (w == "NOT") {
+            if (pos + 1 >= t.size() || peek(t, pos + 1).kind != Token::WORD || !eqKw(peek(t, pos + 1).text, "NULL")) {
+                return false;
+            }
+            col.notNull = true;
+            pos += 2;
+            continue;
+        }
+        if (w == "PRIMARY") {
+            if (pos + 1 >= t.size() || peek(t, pos + 1).kind != Token::WORD || !eqKw(peek(t, pos + 1).text, "KEY")) {
+                return false;
+            }
+            col.primaryKey = true;
+            col.notNull = true;
+            pos += 2;
+            continue;
+        }
+        if (w == "UNIQUE") {
+            col.unique = true;
+            ++pos;
+            continue;
+        }
+        if (w == "REFERENCES") {
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
+                return false;
+            }
+            col.fkRefTable = peek(t, pos).text;
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::LPAREN) {
+                return false;
+            }
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
+                return false;
+            }
+            col.fkRefCol = peek(t, pos).text;
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::RPAREN) {
+                return false;
+            }
+            ++pos;
+            continue;
+        }
+        if (w == "CHECK") {
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::LPAREN) {
+                return false;
+            }
+            ++pos;
+            size_t innerStart = pos;
+            int depth = 1;
+            while (pos < t.size() && depth > 0) {
+                if (peek(t, pos).kind == Token::LPAREN) {
+                    ++depth;
+                    ++pos;
+                } else if (peek(t, pos).kind == Token::RPAREN) {
+                    --depth;
+                    if (depth == 0) {
+                        col.checkExpr = serializeCheckExprFromTokens(t, innerStart, pos);
+                        ++pos;
+                        break;
+                    }
+                    ++pos;
+                } else {
+                    ++pos;
+                }
+            }
+            if (depth != 0) {
+                return false;
+            }
+            continue;
+        }
+        break;
+    }
+    return true;
+}
+
 /**
  * 解析 CREATE TABLE 语句
- * 格式：CREATE TABLE name ( col TYPE [, col TYPE ...] );
+ * 格式：CREATE TABLE name ( col TYPE [NOT NULL] [PRIMARY KEY] [, ...] );
  */
 bool parseCreateTable(const std::vector<Token>& t, size_t& pos, ast::CreateTableStmt& out) {
     if (!expectWord(t, pos, "CREATE") || !expectWord(t, pos, "TABLE")) {
@@ -253,6 +414,14 @@ bool parseCreateTable(const std::vector<Token>& t, size_t& pos, ast::CreateTable
         }
         col.type = *ty;
         ++pos;
+        if (!parseColumnPostConstraints(t, pos, col)) {
+            return false;
+        }
+        for (const auto& c : out.columns) {
+            if (c.name == col.name) {
+                return false;
+            }
+        }
         out.columns.push_back(std::move(col));
         if (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
             ++pos;
@@ -265,6 +434,15 @@ bool parseCreateTable(const std::vector<Token>& t, size_t& pos, ast::CreateTable
     }
     ++pos;
     if (out.columns.empty()) {
+        return false;
+    }
+    int pkCount = 0;
+    for (const auto& c : out.columns) {
+        if (c.primaryKey) {
+            ++pkCount;
+        }
+    }
+    if (pkCount > 1) {
         return false;
     }
     skipSemi(t, pos);
@@ -500,6 +678,12 @@ bool parseAlterTable(const std::vector<Token>& t, size_t& pos, ast::AlterTableSt
             return false;
         }
         out.op = ast::AlterOperation::AddColumn;
+        out.addNotNull = false;
+        out.addPrimaryKey = false;
+        out.addUnique = false;
+        out.addCheckExpr.clear();
+        out.addFkRefTable.clear();
+        out.addFkRefCol.clear();
         out.columnName = peek(t, pos).text;
         ++pos;
         if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
@@ -511,6 +695,18 @@ bool parseAlterTable(const std::vector<Token>& t, size_t& pos, ast::AlterTableSt
         }
         out.columnType = *ty;
         ++pos;
+        ColumnDef tmp;
+        tmp.name = out.columnName;
+        tmp.type = out.columnType;
+        if (!parseColumnPostConstraints(t, pos, tmp)) {
+            return false;
+        }
+        out.addNotNull = tmp.notNull;
+        out.addPrimaryKey = tmp.primaryKey;
+        out.addUnique = tmp.unique;
+        out.addCheckExpr = tmp.checkExpr;
+        out.addFkRefTable = tmp.fkRefTable;
+        out.addFkRefCol = tmp.fkRefCol;
     } else if (opStr == "DROP") {
         // DROP COLUMN
         if (pos >= t.size() || peek(t, pos).kind != Token::WORD || !eqKw(peek(t, pos).text, "COLUMN")) {

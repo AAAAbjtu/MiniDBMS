@@ -27,3 +27,11 @@ cmake-build-*/
 
 # Debug symbol files
 *.dsym/
+
+# 屏蔽 VS 所有缓存文件
+.vs/
+*.ipch
+*.suo
+*.user
+Debug/
+x64-Debug/

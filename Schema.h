@@ -23,6 +23,12 @@ enum class SqlType {
 struct ColumnDef {
     std::string name;  // 列名
     SqlType type = SqlType::Text;  // 列类型，默认文本类型
+    bool notNull = false;     // NOT NULL：TEXT 不允许空串；整型/浮点允许 0
+    bool primaryKey = false;  // 主键：隐含 NOT NULL，且列值全局唯一
+    bool unique = false;      // UNIQUE（非主键列可单独声明）
+    std::string checkExpr;    // CHECK 条件体（不含外层括号），空表示无
+    std::string fkRefTable;   // 外键引用表，空表示无
+    std::string fkRefCol;     // 外键引用列（须为被引用表的 PRIMARY KEY 或 UNIQUE）
 };
 
 /**
@@ -69,5 +75,10 @@ bool cellEqualsTyped(const Cell& a, const Cell& b, SqlType t);
  * @return 对应的字符串表示
  */
 std::string sqlTypeToString(SqlType t);
+
+/**
+ * 是否违反 NOT NULL 约束（本引擎无 SQL NULL，TEXT 空串视为违反）
+ */
+bool cellViolatesNotNull(const Cell& c, SqlType t);
 
 #endif
