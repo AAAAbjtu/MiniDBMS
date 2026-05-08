@@ -23,14 +23,6 @@ private:
     bool ensureConnected();
     
     /**
-     * 加载表
-     * 如果表已加载则返回现有表，否则从文件加载
-     * @param tableName 表名
-     * @return 表对象引用
-     */
-    Table& loadTable(const std::string& tableName);
-    
-    /**
      * 打印查询结果
      * @param table 表对象
      * @param rows 记录列表
@@ -43,6 +35,11 @@ public:
      * 构造函数
      */
     Executor();
+
+    /**
+     * 加载表（子查询等需要访问）
+     */
+    Table& loadTable(const std::string& tableName);
 
     const std::string& getCurrentUser() const { return currentUser; }
     const std::string& getCurrentDb()   const { return currentDb; }

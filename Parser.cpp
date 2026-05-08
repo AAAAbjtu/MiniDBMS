@@ -7,6 +7,8 @@
 #include "Schema.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -160,6 +162,21 @@ bool lexSql(const std::string& sql, std::vector<Token>& out, std::string& err) {
             ++i;
             continue;
         }
+        if (c == '+') {
+            out.push_back({Token::PLUS, ""});
+            ++i;
+            continue;
+        }
+        if (c == '/') {
+            out.push_back({Token::SLASH, ""});
+            ++i;
+            continue;
+        }
+        if (c == '.' && (i + 1 >= n || !std::isdigit(static_cast<unsigned char>(sql[i + 1])))) {
+            out.push_back({Token::DOT, ""});
+            ++i;
+            continue;
+        }
         if (c == '-' && i + 1 < n &&
             (std::isdigit(static_cast<unsigned char>(sql[i + 1])) ||
              (sql[i + 1] == '.' && i + 2 < n && std::isdigit(static_cast<unsigned char>(sql[i + 2]))))) {
@@ -180,6 +197,11 @@ bool lexSql(const std::string& sql, std::vector<Token>& out, std::string& err) {
                 }
             }
             out.push_back({Token::NUMBER, s});
+            continue;
+        }
+        if (c == '-') {
+            out.push_back({Token::MINUS, ""});
+            ++i;
             continue;
         }
         if (std::isdigit(c) ||
@@ -274,6 +296,14 @@ std::string tokenToCheckFragment(const Token& tok) {
     }
     case Token::EQ:
         return "=";
+    case Token::DOT:
+        return ".";
+    case Token::PLUS:
+        return "+";
+    case Token::MINUS:
+        return "-";
+    case Token::SLASH:
+        return "/";
     case Token::LPAREN:
         return "(";
     case Token::RPAREN:
@@ -298,6 +328,87 @@ std::string serializeCheckExprFromTokens(const std::vector<Token>& t, size_t sta
         o += frag;
     }
     return o;
+}
+
+/** 将 Token 区间还原为可再解析的 SQL 文本（子查询序列化） */
+static std::string serializeTokensRange(const std::vector<Token>& t, size_t start, size_t endExclusive) {
+    return serializeCheckExprFromTokens(t, start, endExclusive);
+}
+
+static bool isSelectClauseBoundary(const std::vector<Token>& t, size_t pos) {
+    if (pos >= t.size()) {
+        return true;
+    }
+    if (peek(t, pos).kind == Token::END || peek(t, pos).kind == Token::SEMICOLON) {
+        return true;
+    }
+    if (peek(t, pos).kind != Token::WORD) {
+        return false;
+    }
+    std::string w = upper(peek(t, pos).text);
+    return w == "WHERE" || w == "GROUP" || w == "HAVING" || w == "ORDER" || w == "LIMIT" || w == "UNION" ||
+           w == "INTERSECT" || w == "EXCEPT";
+}
+
+static bool extractParenWrappedRange(const std::vector<Token>& t, size_t& pos, size_t& innerStart, size_t& innerEnd,
+                                     std::string& err) {
+    if (pos >= t.size() || peek(t, pos).kind != Token::LPAREN) {
+        err = "期望 (";
+        return false;
+    }
+    innerStart = pos + 1;
+    int depth = 0;
+    size_t i = pos;
+    for (; i < t.size(); ++i) {
+        if (peek(t, i).kind == Token::LPAREN) {
+            ++depth;
+        } else if (peek(t, i).kind == Token::RPAREN) {
+            --depth;
+            if (depth == 0) {
+                innerEnd = i;
+                pos = i + 1;
+                return true;
+            }
+        }
+    }
+    err = "未闭合的括号";
+    return false;
+}
+
+static bool parseInLiteralListBounded(const std::vector<Token>& t, size_t& pos, size_t endExclusive,
+                                      std::vector<Cell>& out, std::string& err) {
+    out.clear();
+    if (pos >= endExclusive) {
+        err = "IN 列表不能为空";
+        return false;
+    }
+    while (pos < endExclusive) {
+        if (peek(t, pos).kind == Token::STRING) {
+            out.push_back(Cell{peek(t, pos).text});
+            ++pos;
+        } else if (peek(t, pos).kind == Token::NUMBER) {
+            auto c = parseNumericLiteralCell(peek(t, pos).text);
+            if (!c.has_value()) {
+                err = "IN 列表数字无效";
+                return false;
+            }
+            out.push_back(*c);
+            ++pos;
+        } else {
+            err = "IN 列表仅支持数字或字符串字面量";
+            return false;
+        }
+        if (pos < endExclusive && peek(t, pos).kind == Token::COMMA) {
+            ++pos;
+            continue;
+        }
+        break;
+    }
+    if (pos != endExclusive) {
+        err = "IN 列表语法错误";
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -522,6 +633,506 @@ bool parseInsert(const std::vector<Token>& t, size_t& pos, ast::InsertStmt& out)
     return true;
 }
 
+// ---------- SELECT 表达式 / 多表 FROM ----------
+
+static ast::QueryExprPtr makeLiteralCell(const Cell& c) {
+    auto e = std::make_unique<ast::QueryExpr>();
+    ast::QLiteral L;
+    L.value = c;
+    e->node = std::move(L);
+    return e;
+}
+
+static ast::QueryExprPtr makeColRef(std::optional<std::string> tab, std::string name) {
+    auto e = std::make_unique<ast::QueryExpr>();
+    ast::QColumnRef r;
+    r.table = std::move(tab);
+    r.name = std::move(name);
+    e->node = std::move(r);
+    return e;
+}
+
+static ast::QueryExprPtr makeBinary(ast::QueryExprPtr l, std::string op, ast::QueryExprPtr r) {
+    auto e = std::make_unique<ast::QueryExpr>();
+    ast::QBinary b;
+    b.op = std::move(op);
+    b.left = std::move(l);
+    b.right = std::move(r);
+    e->node = std::move(b);
+    return e;
+}
+
+static ast::QueryExprPtr makeUnaryNot(ast::QueryExprPtr c) {
+    auto e = std::make_unique<ast::QueryExpr>();
+    ast::QUnary u;
+    u.op = ast::QUnary::Op::Not;
+    u.child = std::move(c);
+    e->node = std::move(u);
+    return e;
+}
+
+static ast::QueryExprPtr makeCall(std::string name, std::vector<ast::QueryExprPtr> args) {
+    auto e = std::make_unique<ast::QueryExpr>();
+    ast::QCall c;
+    c.name = std::move(name);
+    c.args = std::move(args);
+    e->node = std::move(c);
+    return e;
+}
+
+static ast::QueryExprPtr parseExpr(const std::vector<Token>& t, size_t& pos, std::string& err);
+
+static ast::QueryExprPtr parsePrimary(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    if (pos >= t.size()) {
+        err = "表达式意外结束";
+        return nullptr;
+    }
+    const Token& tk = peek(t, pos);
+    if (tk.kind == Token::LPAREN) {
+        ++pos;
+        ast::QueryExprPtr e = parseExpr(t, pos, err);
+        if (!e) {
+            return nullptr;
+        }
+        if (pos >= t.size() || peek(t, pos).kind != Token::RPAREN) {
+            err = "期望 )";
+            return nullptr;
+        }
+        ++pos;
+        return e;
+    }
+    if (tk.kind == Token::STRING) {
+        ++pos;
+        return makeLiteralCell(Cell{tk.text});
+    }
+    if (tk.kind == Token::NUMBER) {
+        ++pos;
+        auto c = parseNumericLiteralCell(tk.text);
+        if (!c.has_value()) {
+            err = "无效数字";
+            return nullptr;
+        }
+        return makeLiteralCell(*c);
+    }
+    if (tk.kind != Token::WORD) {
+        err = "无效的表达式起点";
+        return nullptr;
+    }
+    if (eqKw(tk.text, "NOT") || eqKw(tk.text, "AND") || eqKw(tk.text, "OR")) {
+        err = "此处不能使用关键字: " + tk.text;
+        return nullptr;
+    }
+    if (eqKw(tk.text, "EXISTS")) {
+        ++pos;
+        size_t is = 0;
+        size_t ie = 0;
+        if (!extractParenWrappedRange(t, pos, is, ie, err)) {
+            return nullptr;
+        }
+        if (is >= ie || peek(t, is).kind != Token::WORD || !eqKw(peek(t, is).text, "SELECT")) {
+            err = "EXISTS 内须为 SELECT 子查询";
+            return nullptr;
+        }
+        auto e = std::make_unique<ast::QueryExpr>();
+        ast::QExistsSubquery ex;
+        ex.subquerySql = serializeTokensRange(t, is, ie);
+        e->node = std::move(ex);
+        return e;
+    }
+    if (eqKw(tk.text, "COUNT") && pos + 1 < t.size() && peek(t, pos + 1).kind == Token::LPAREN) {
+        pos += 2;
+        auto e = std::make_unique<ast::QueryExpr>();
+        ast::QCall c;
+        c.name = "COUNT";
+        if (pos < t.size() && peek(t, pos).kind == Token::WORD && peek(t, pos).text == "*") {
+            ++pos;
+            c.countStar = true;
+        } else if (pos < t.size() && peek(t, pos).kind == Token::RPAREN) {
+            c.countStar = true;
+        } else {
+            ast::QueryExprPtr a = parseExpr(t, pos, err);
+            if (!a) {
+                return nullptr;
+            }
+            c.args.push_back(std::move(a));
+        }
+        if (pos >= t.size() || peek(t, pos).kind != Token::RPAREN) {
+            err = "COUNT 期望 )";
+            return nullptr;
+        }
+        ++pos;
+        e->node = std::move(c);
+        return e;
+    }
+    if (pos + 1 < t.size() && peek(t, pos + 1).kind == Token::LPAREN) {
+        std::string fname = tk.text;
+        pos += 2;
+        std::vector<ast::QueryExprPtr> args;
+        if (pos < t.size() && peek(t, pos).kind == Token::RPAREN) {
+            ++pos;
+        } else {
+            for (;;) {
+                ast::QueryExprPtr a = parseExpr(t, pos, err);
+                if (!a) {
+                    return nullptr;
+                }
+                args.push_back(std::move(a));
+                if (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
+                    ++pos;
+                    continue;
+                }
+                break;
+            }
+            if (pos >= t.size() || peek(t, pos).kind != Token::RPAREN) {
+                err = "期望 )";
+                return nullptr;
+            }
+            ++pos;
+        }
+        return makeCall(std::move(fname), std::move(args));
+    }
+    if (pos + 2 < t.size() && peek(t, pos + 1).kind == Token::DOT && peek(t, pos + 2).kind == Token::WORD &&
+        peek(t, pos + 2).text != "*") {
+        std::string qual = tk.text;
+        pos += 2;
+        std::string cname = peek(t, pos).text;
+        ++pos;
+        return makeColRef(std::optional<std::string>{std::move(qual)}, std::move(cname));
+    }
+    std::string cname = tk.text;
+    ++pos;
+    return makeColRef(std::nullopt, std::move(cname));
+}
+
+static ast::QueryExprPtr parseUnary(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    if (pos < t.size() && peek(t, pos).kind == Token::PLUS) {
+        ++pos;
+        return parseUnary(t, pos, err);
+    }
+    if (pos < t.size() && peek(t, pos).kind == Token::MINUS) {
+        ++pos;
+        ast::QueryExprPtr p = parseUnary(t, pos, err);
+        if (!p) {
+            return nullptr;
+        }
+        return makeBinary(makeLiteralCell(Cell{static_cast<std::int64_t>(0)}), "-", std::move(p));
+    }
+    return parsePrimary(t, pos, err);
+}
+
+static ast::QueryExprPtr parseMul(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    ast::QueryExprPtr left = parseUnary(t, pos, err);
+    if (!left) {
+        return nullptr;
+    }
+    while (pos < t.size()) {
+        std::string op;
+        if (peek(t, pos).kind == Token::WORD && peek(t, pos).text == "*") {
+            op = "*";
+            ++pos;
+        } else if (peek(t, pos).kind == Token::SLASH) {
+            op = "/";
+            ++pos;
+        } else {
+            break;
+        }
+        ast::QueryExprPtr right = parseUnary(t, pos, err);
+        if (!right) {
+            return nullptr;
+        }
+        left = makeBinary(std::move(left), op, std::move(right));
+    }
+    return left;
+}
+
+static ast::QueryExprPtr parseAdditive(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    ast::QueryExprPtr left = parseMul(t, pos, err);
+    if (!left) {
+        return nullptr;
+    }
+    while (pos < t.size() && (peek(t, pos).kind == Token::PLUS || peek(t, pos).kind == Token::MINUS)) {
+        std::string op = (peek(t, pos).kind == Token::PLUS) ? "+" : "-";
+        ++pos;
+        ast::QueryExprPtr right = parseMul(t, pos, err);
+        if (!right) {
+            return nullptr;
+        }
+        left = makeBinary(std::move(left), op, std::move(right));
+    }
+    return left;
+}
+
+static ast::QueryExprPtr parseComparison(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    ast::QueryExprPtr left = parseAdditive(t, pos, err);
+    if (!left) {
+        return nullptr;
+    }
+    bool notIn = false;
+    if (pos + 1 < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "NOT") &&
+        eqKw(peek(t, pos + 1).text, "IN")) {
+        notIn = true;
+        pos += 2;
+    } else if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "IN")) {
+        ++pos;
+    } else {
+        std::string op;
+        if (pos < t.size()) {
+            if (peek(t, pos).kind == Token::EQ) {
+                op = "=";
+                ++pos;
+            } else if (peek(t, pos).kind == Token::WORD) {
+                std::string w = peek(t, pos).text;
+                if (w == "<=" || w == ">=" || w == "<>" || w == "<" || w == ">" || w == "!=") {
+                    op = w;
+                    ++pos;
+                }
+            }
+        }
+        if (op.empty()) {
+            return left;
+        }
+        ast::QueryExprPtr right = parseAdditive(t, pos, err);
+        if (!right) {
+            return nullptr;
+        }
+        return makeBinary(std::move(left), op, std::move(right));
+    }
+    if (pos >= t.size() || peek(t, pos).kind != Token::LPAREN) {
+        err = "IN 后期望 (";
+        return nullptr;
+    }
+    size_t innerStart = 0;
+    size_t innerEnd = 0;
+    if (!extractParenWrappedRange(t, pos, innerStart, innerEnd, err)) {
+        return nullptr;
+    }
+    auto e = std::make_unique<ast::QueryExpr>();
+    ast::QInSubquery qin;
+    qin.left = std::move(left);
+    qin.notIn = notIn;
+    if (innerStart < innerEnd && peek(t, innerStart).kind == Token::WORD && eqKw(peek(t, innerStart).text, "SELECT")) {
+        qin.subquerySql = serializeTokensRange(t, innerStart, innerEnd);
+    } else {
+        size_t p2 = innerStart;
+        if (!parseInLiteralListBounded(t, p2, innerEnd, qin.inValues, err)) {
+            return nullptr;
+        }
+    }
+    e->node = std::move(qin);
+    return e;
+}
+
+static ast::QueryExprPtr parseNot(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "NOT")) {
+        ++pos;
+        ast::QueryExprPtr c = parseNot(t, pos, err);
+        if (!c) {
+            return nullptr;
+        }
+        return makeUnaryNot(std::move(c));
+    }
+    return parseComparison(t, pos, err);
+}
+
+static ast::QueryExprPtr parseAnd(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    ast::QueryExprPtr left = parseNot(t, pos, err);
+    if (!left) {
+        return nullptr;
+    }
+    while (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "AND")) {
+        ++pos;
+        ast::QueryExprPtr right = parseNot(t, pos, err);
+        if (!right) {
+            return nullptr;
+        }
+        left = makeBinary(std::move(left), "AND", std::move(right));
+    }
+    return left;
+}
+
+static ast::QueryExprPtr parseOr(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    ast::QueryExprPtr left = parseAnd(t, pos, err);
+    if (!left) {
+        return nullptr;
+    }
+    while (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "OR")) {
+        ++pos;
+        ast::QueryExprPtr right = parseAnd(t, pos, err);
+        if (!right) {
+            return nullptr;
+        }
+        left = makeBinary(std::move(left), "OR", std::move(right));
+    }
+    return left;
+}
+
+static ast::QueryExprPtr parseExpr(const std::vector<Token>& t, size_t& pos, std::string& err) {
+    return parseOr(t, pos, err);
+}
+
+static bool isReservedAlias(const std::string& w) {
+    std::string u = upper(w);
+    return u == "INNER" || u == "LEFT" || u == "RIGHT" || u == "OUTER" || u == "JOIN" || u == "ON" || u == "WHERE" ||
+           u == "AND" || u == "OR" || u == "SELECT" || u == "FROM" || u == "GROUP" || u == "HAVING" || u == "ORDER" ||
+           u == "BY" || u == "LIMIT" || u == "OFFSET" || u == "AS" || u == "DISTINCT" || u == "UNION" ||
+           u == "INTERSECT" || u == "EXCEPT" || u == "ALL";
+}
+
+static bool parseTableAndAlias(const std::vector<Token>& t, size_t& pos, std::string& table, std::string& alias,
+                               std::string& err) {
+    if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
+        err = "期望表名";
+        return false;
+    }
+    table = peek(t, pos).text;
+    ++pos;
+    alias.clear();
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "AS")) {
+        ++pos;
+        if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
+            err = "AS 后期望别名";
+            return false;
+        }
+        alias = peek(t, pos).text;
+        ++pos;
+        return true;
+    }
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && !isReservedAlias(peek(t, pos).text)) {
+        alias = peek(t, pos).text;
+        ++pos;
+    }
+    return true;
+}
+
+static bool parseFromClause(const std::vector<Token>& t, size_t& pos, std::vector<ast::FromTableSpec>& out,
+                            std::string& err) {
+    std::string table;
+    std::string alias;
+    if (!parseTableAndAlias(t, pos, table, alias, err)) {
+        return false;
+    }
+    ast::FromTableSpec first;
+    first.table = std::move(table);
+    first.alias = std::move(alias);
+    first.joinOn.reset();
+    first.joinKind = ast::JoinKind::Inner;
+    out.push_back(std::move(first));
+    if (pos >= t.size()) {
+        return true;
+    }
+    if (peek(t, pos).kind == Token::COMMA) {
+        while (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
+            ++pos;
+            if (isSelectClauseBoundary(t, pos)) {
+                err = "FROM 子句在 , 后期望另一张表";
+                return false;
+            }
+            if (!parseTableAndAlias(t, pos, table, alias, err)) {
+                return false;
+            }
+            ast::FromTableSpec s;
+            s.table = std::move(table);
+            s.alias = std::move(alias);
+            s.joinOn.reset();
+            s.joinKind = ast::JoinKind::Inner;
+            out.push_back(std::move(s));
+        }
+        if (pos < t.size() && peek(t, pos).kind == Token::WORD &&
+            (eqKw(peek(t, pos).text, "INNER") || eqKw(peek(t, pos).text, "JOIN") || eqKw(peek(t, pos).text, "LEFT"))) {
+            err = "逗号分隔的多表与 JOIN 不能混用，请统一使用逗号或 JOIN 链";
+            return false;
+        }
+        return true;
+    }
+    for (;;) {
+        if (isSelectClauseBoundary(t, pos)) {
+            break;
+        }
+        ast::JoinKind jk = ast::JoinKind::Inner;
+        if (peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "LEFT")) {
+            ++pos;
+            if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "OUTER")) {
+                ++pos;
+            }
+            jk = ast::JoinKind::Left;
+        } else if (peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "INNER")) {
+            ++pos;
+        }
+        if (!(peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "JOIN"))) {
+            break;
+        }
+        ++pos;
+        if (!parseTableAndAlias(t, pos, table, alias, err)) {
+            return false;
+        }
+        if (!expectWord(t, pos, "ON")) {
+            err = "JOIN 后需要 ON";
+            return false;
+        }
+        ast::QueryExprPtr on = parseExpr(t, pos, err);
+        if (!on) {
+            return false;
+        }
+        ast::FromTableSpec s;
+        s.table = std::move(table);
+        s.alias = std::move(alias);
+        s.joinOn = std::move(on);
+        s.joinKind = jk;
+        out.push_back(std::move(s));
+    }
+    return true;
+}
+
+static bool parseSelectList(const std::vector<Token>& t, size_t& pos, std::vector<ast::SelectItem>& items,
+                            std::string& err) {
+    items.clear();
+    for (;;) {
+        if (pos >= t.size()) {
+            err = "SELECT 列表意外结束";
+            return false;
+        }
+        if (peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "FROM")) {
+            break;
+        }
+        ast::SelectItem it;
+        if (peek(t, pos).kind == Token::WORD && peek(t, pos).text == "*") {
+            it.kind = ast::SelectItemKind::Star;
+            ++pos;
+        } else if (pos + 2 < t.size() && peek(t, pos).kind == Token::WORD && peek(t, pos + 1).kind == Token::DOT &&
+                   peek(t, pos + 2).kind == Token::WORD && peek(t, pos + 2).text == "*") {
+            it.kind = ast::SelectItemKind::Star;
+            it.starTable = peek(t, pos).text;
+            pos += 3;
+        } else {
+            it.kind = ast::SelectItemKind::Expr;
+            it.expr = parseExpr(t, pos, err);
+            if (!it.expr) {
+                return false;
+            }
+            if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "AS")) {
+                ++pos;
+                if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
+                    err = "AS 后期望别名";
+                    return false;
+                }
+                it.outputAlias = peek(t, pos).text;
+                ++pos;
+            }
+        }
+        items.push_back(std::move(it));
+        if (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
+            ++pos;
+            continue;
+        }
+        break;
+    }
+    if (items.empty()) {
+        err = "SELECT 至少指定一列";
+        return false;
+    }
+    return true;
+}
+
 /**
  * 解析 WHERE 子句
  * 格式：WHERE col = value
@@ -551,42 +1162,248 @@ bool parseWhere(const std::vector<Token>& t, size_t& pos, std::string& col, std:
     return true;
 }
 
-/**
- * 解析 SELECT 语句
- * 格式：SELECT *|col1,col2 FROM table [WHERE ...]
- */
-bool parseSelect(const std::vector<Token>& t, size_t& pos, ast::SelectStmt& out) {
-    if (!expectWord(t, pos, "SELECT")) {
-        return false;
-    }
-    if (pos >= t.size()) {
-        return false;
-    }
-    if (peek(t, pos).kind == Token::WORD && peek(t, pos).text == "*") {
-        out.selectAll = true;
+static bool parseGroupByHaving(const std::vector<Token>& t, size_t& pos, ast::SelectStmt& out,
+                               std::string& errMsg) {
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "GROUP")) {
         ++pos;
-    } else {
-        // 解析指定列
-        while (pos < t.size() && peek(t, pos).kind == Token::WORD && !eqKw(peek(t, pos).text, "FROM")) {
-            out.columns.push_back(peek(t, pos).text);
-            ++pos;
+        if (!expectWord(t, pos, "BY")) {
+            errMsg = "GROUP 后需要 BY";
+            return false;
+        }
+        for (;;) {
+            ast::QueryExprPtr ge = parseExpr(t, pos, errMsg);
+            if (!ge) {
+                return false;
+            }
+            out.groupBy.push_back(std::move(ge));
             if (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
                 ++pos;
-            } else {
-                break;
+                continue;
             }
+            break;
         }
     }
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "HAVING")) {
+        ++pos;
+        out.having = parseExpr(t, pos, errMsg);
+        if (!out.having) {
+            if (errMsg.empty()) {
+                errMsg = "HAVING 表达式无效";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parseOrderByLimitForSelectStmt(const std::vector<Token>& t, size_t& pos, ast::SelectStmt& out,
+                                           std::string& errMsg) {
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "ORDER")) {
+        ++pos;
+        if (!expectWord(t, pos, "BY")) {
+            errMsg = "ORDER 后需要 BY";
+            return false;
+        }
+        for (;;) {
+            ast::OrderByTerm ob;
+            ob.expr = parseExpr(t, pos, errMsg);
+            if (!ob.expr) {
+                return false;
+            }
+            if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "DESC")) {
+                ob.descending = true;
+                ++pos;
+            } else if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "ASC")) {
+                ++pos;
+            }
+            out.orderBy.push_back(std::move(ob));
+            if (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
+                ++pos;
+                continue;
+            }
+            break;
+        }
+    }
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "LIMIT")) {
+        ++pos;
+        if (pos >= t.size() || peek(t, pos).kind != Token::NUMBER) {
+            errMsg = "LIMIT 后期望整数";
+            return false;
+        }
+        try {
+            out.limit = static_cast<std::int64_t>(std::stoll(peek(t, pos).text));
+        } catch (...) {
+            errMsg = "LIMIT 数值无效";
+            return false;
+        }
+        ++pos;
+        if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "OFFSET")) {
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::NUMBER) {
+                errMsg = "OFFSET 后期望整数";
+                return false;
+            }
+            try {
+                out.offset = static_cast<std::int64_t>(std::stoll(peek(t, pos).text));
+            } catch (...) {
+                errMsg = "OFFSET 数值无效";
+                return false;
+            }
+            ++pos;
+        }
+    }
+    return true;
+}
+
+static bool parseCompoundTrailingOrderLimit(const std::vector<Token>& t, size_t& pos, ast::CompoundSelectStmt& out,
+                                            std::string& errMsg) {
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "ORDER")) {
+        ++pos;
+        if (!expectWord(t, pos, "BY")) {
+            errMsg = "ORDER 后需要 BY";
+            return false;
+        }
+        for (;;) {
+            ast::OrderByTerm ob;
+            ob.expr = parseExpr(t, pos, errMsg);
+            if (!ob.expr) {
+                return false;
+            }
+            if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "DESC")) {
+                ob.descending = true;
+                ++pos;
+            } else if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "ASC")) {
+                ++pos;
+            }
+            out.compoundOrderBy.push_back(std::move(ob));
+            if (pos < t.size() && peek(t, pos).kind == Token::COMMA) {
+                ++pos;
+                continue;
+            }
+            break;
+        }
+    }
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "LIMIT")) {
+        ++pos;
+        if (pos >= t.size() || peek(t, pos).kind != Token::NUMBER) {
+            errMsg = "LIMIT 后期望整数";
+            return false;
+        }
+        try {
+            out.compoundLimit = static_cast<std::int64_t>(std::stoll(peek(t, pos).text));
+        } catch (...) {
+            errMsg = "LIMIT 数值无效";
+            return false;
+        }
+        ++pos;
+        if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "OFFSET")) {
+            ++pos;
+            if (pos >= t.size() || peek(t, pos).kind != Token::NUMBER) {
+                errMsg = "OFFSET 后期望整数";
+                return false;
+            }
+            try {
+                out.compoundOffset = static_cast<std::int64_t>(std::stoll(peek(t, pos).text));
+            } catch (...) {
+                errMsg = "OFFSET 数值无效";
+                return false;
+            }
+            ++pos;
+        }
+    }
+    return true;
+}
+
+static bool parseSelectArmBody(const std::vector<Token>& t, size_t& pos, ast::SelectStmt& out,
+                               std::string& errMsg) {
+    out = ast::SelectStmt{};
+    if (!expectWord(t, pos, "SELECT")) {
+        errMsg = "需要 SELECT";
+        return false;
+    }
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "DISTINCT")) {
+        out.distinct = true;
+        ++pos;
+    }
+    std::vector<ast::SelectItem> items;
+    if (!parseSelectList(t, pos, items, errMsg)) {
+        return false;
+    }
     if (!expectWord(t, pos, "FROM")) {
+        errMsg = "需要 FROM";
         return false;
     }
-    if (pos >= t.size() || peek(t, pos).kind != Token::WORD) {
+    std::vector<ast::FromTableSpec> from;
+    if (!parseFromClause(t, pos, from, errMsg)) {
         return false;
     }
-    out.table = peek(t, pos).text;
-    ++pos;
-    if (!parseWhere(t, pos, out.whereColumn, out.whereValue)) {
+    ast::QueryExprPtr whereExpr;
+    if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "WHERE")) {
+        ++pos;
+        whereExpr = parseExpr(t, pos, errMsg);
+        if (!whereExpr) {
+            if (errMsg.empty()) {
+                errMsg = "WHERE 表达式无效";
+            }
+            return false;
+        }
+    }
+    out.selectList = std::move(items);
+    out.from = std::move(from);
+    out.where = std::move(whereExpr);
+    if (!parseGroupByHaving(t, pos, out, errMsg)) {
         return false;
+    }
+    return true;
+}
+
+static bool parseCompoundSelect(const std::vector<Token>& t, size_t& pos, ast::CompoundSelectStmt& out,
+                                std::string& errMsg) {
+    errMsg.clear();
+    ast::SelectStmt arm0;
+    if (!parseSelectArmBody(t, pos, arm0, errMsg)) {
+        return false;
+    }
+    out = ast::CompoundSelectStmt{};
+    out.arms.push_back(std::move(arm0));
+    while (pos < t.size() && peek(t, pos).kind == Token::WORD) {
+        std::string w = upper(peek(t, pos).text);
+        ast::SetOperator op{};
+        bool hasOp = false;
+        if (w == "UNION") {
+            op = ast::SetOperator::Union;
+            hasOp = true;
+        } else if (w == "INTERSECT") {
+            op = ast::SetOperator::Intersect;
+            hasOp = true;
+        } else if (w == "EXCEPT") {
+            op = ast::SetOperator::Except;
+            hasOp = true;
+        }
+        if (!hasOp) {
+            break;
+        }
+        ++pos;
+        bool all = false;
+        if (pos < t.size() && peek(t, pos).kind == Token::WORD && eqKw(peek(t, pos).text, "ALL")) {
+            all = true;
+            ++pos;
+        }
+        ast::SelectStmt next;
+        if (!parseSelectArmBody(t, pos, next, errMsg)) {
+            return false;
+        }
+        out.ops.push_back({op, all});
+        out.arms.push_back(std::move(next));
+    }
+    if (out.arms.size() > 1) {
+        if (!parseCompoundTrailingOrderLimit(t, pos, out, errMsg)) {
+            return false;
+        }
+    } else {
+        if (!parseOrderByLimitForSelectStmt(t, pos, out.arms[0], errMsg)) {
+            return false;
+        }
     }
     skipSemi(t, pos);
     return true;
@@ -1269,14 +2086,15 @@ ParseResult Parser::parse(const std::string& sql) {
         return r;
     }
 
-    // 解析 SELECT 语句
+    // 解析 SELECT / 复合查询（UNION / INTERSECT / EXCEPT）
     if (kw == "SELECT") {
-        ast::SelectStmt s;
-        if (!parseSelect(tokens, pos, s)) {
-            r.errorMsg = "SELECT 语法错误";
+        ast::CompoundSelectStmt cs;
+        std::string selErr;
+        if (!parseCompoundSelect(tokens, pos, cs, selErr)) {
+            r.errorMsg = selErr.empty() ? "SELECT 语法错误" : ("SELECT: " + selErr);
             return r;
         }
-        r.stmt = ast::Stmt{std::move(s)};
+        r.stmt = ast::Stmt{std::move(cs)};
         return r;
     }
 

@@ -39,9 +39,13 @@ add_executable(MiniDB
     Constraints.cpp
     FileManager.cpp
     Parser.cpp
+    QueryEval.cpp
     Executor.cpp
     ApiServer.cpp
 )
+
+# Header-only: INTERFACE include paths for httplib / nlohmann_json
+target_link_libraries(MiniDB PRIVATE httplib::httplib nlohmann_json::nlohmann_json)
 
 # Headers for IDE integration
 target_sources(MiniDB PRIVATE
@@ -53,6 +57,7 @@ target_sources(MiniDB PRIVATE
     FileManager.h
     Parser.h
     Executor.h
+    QueryEval.h
 )
 
 # MinGW: link runtime libraries statically for a self-contained exe

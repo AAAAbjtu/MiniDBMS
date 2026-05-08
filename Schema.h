@@ -60,6 +60,9 @@ std::optional<Cell> parseLiteralToCell(const std::string& raw, SqlType t);
  */
 std::string cellToString(const Cell& c);
 
+/** 打印查询结果中的可空单元格 */
+std::string cellToString(const std::optional<Cell>& c);
+
 /**
  * 同类型相等比较（用于 WHERE 条件）
  * @param a 第一个 Cell
@@ -68,6 +71,22 @@ std::string cellToString(const Cell& c);
  * @return 是否相等
  */
 bool cellEqualsTyped(const Cell& a, const Cell& b, SqlType t);
+
+/**
+ * 将无类型数字字面量解析为 Cell（无小数部分则为 INT，否则 FLOAT）
+ */
+std::optional<Cell> parseNumericLiteralCell(const std::string& raw);
+
+/**
+ * 用于表达式的真值：INT/FLOAT 非零、TEXT 非空串为真
+ */
+bool cellTruthy(const Cell& c);
+
+/**
+ * 宽松比较（用于二元比较表达式）：两操作数尽量提升为双精度或按字符串比较
+ * @return 小于 -1，等于 0，大于 1；无法比较时返回 nullopt
+ */
+std::optional<int> cellCompareLoose(const Cell& a, const Cell& b);
 
 /**
  * 将 SqlType 转换为字符串

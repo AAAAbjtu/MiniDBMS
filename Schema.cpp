@@ -103,6 +103,13 @@ std::optional<Cell> parseLiteralToCell(const std::string& raw, SqlType t) {
  * @param c Cell 对象
  * @return 字符串表示
  */
+std::string cellToString(const std::optional<Cell>& c) {
+    if (!c.has_value()) {
+        return "NULL";
+    }
+    return cellToString(*c);
+}
+
 std::string cellToString(const Cell& c) {
     return std::visit(
         [](const auto& v) -> std::string {
@@ -146,12 +153,97 @@ bool cellViolatesNotNull(const Cell& c, SqlType t) {
 }
 
 /**
+ * 将无类型数字字面量解析为 Cell
+ */
+std::optional<Cell> parseNumericLiteralCell(const std::string& raw) {
+    std::string s = trim(raw);
+    if (s.empty()) {
+        return std::nullopt;
+    }
+    try {
+        bool hasDot = s.find('.') != std::string::npos;
+        if (hasDot) {
+            size_t idx = 0;
+            double v = std::stod(s, &idx);
+            if (idx != s.size()) {
+                return std::nullopt;
+            }
+            return Cell{v};
+        }
+        size_t idx = 0;
+        std::int64_t v = static_cast<std::int64_t>(std::stoll(s, &idx, 10));
+        if (idx != s.size()) {
+            return std::nullopt;
+        }
+        return Cell{v};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+bool cellTruthy(const Cell& c) {
+    if (const auto* i = std::get_if<std::int64_t>(&c)) {
+        return *i != 0;
+    }
+    if (const auto* d = std::get_if<double>(&c)) {
+        return *d != 0.0 && !std::isnan(*d);
+    }
+    if (const auto* s = std::get_if<std::string>(&c)) {
+        return !s->empty();
+    }
+    return false;
+}
+
+static std::optional<int> compareStrings(const Cell& a, const Cell& b) {
+    const auto* sa = std::get_if<std::string>(&a);
+    const auto* sb = std::get_if<std::string>(&b);
+    if (!sa || !sb) {
+        return std::nullopt;
+    }
+    if (*sa < *sb) {
+        return -1;
+    }
+    if (*sa > *sb) {
+        return 1;
+    }
+    return 0;
+}
+
+std::optional<int> cellCompareLoose(const Cell& a, const Cell& b) {
+    if (auto cs = compareStrings(a, b)) {
+        return cs;
+    }
+    if (std::holds_alternative<std::string>(a) || std::holds_alternative<std::string>(b)) {
+        return std::nullopt;
+    }
+    double da = 0.0;
+    double db = 0.0;
+    if (const auto* ia = std::get_if<std::int64_t>(&a)) {
+        da = static_cast<double>(*ia);
+    } else if (const auto* fa = std::get_if<double>(&a)) {
+        da = *fa;
+    } else {
+        return std::nullopt;
+    }
+    if (const auto* ib = std::get_if<std::int64_t>(&b)) {
+        db = static_cast<double>(*ib);
+    } else if (const auto* fb = std::get_if<double>(&b)) {
+        db = *fb;
+    } else {
+        return std::nullopt;
+    }
+    if (da < db) {
+        return -1;
+    }
+    if (da > db) {
+        return 1;
+    }
+    return 0;
+}
+
+/**
  * 同类型相等比较
  * 用于 WHERE 条件的比较运算
- * @param a 第一个 Cell
- * @param b 第二个 Cell
- * @param t 列类型
- * @return 是否相等
  */
 bool cellEqualsTyped(const Cell& a, const Cell& b, SqlType t) {
     if (t == SqlType::Int) {

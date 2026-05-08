@@ -10,7 +10,7 @@
  * 词法单元
  * 参考 MySQL 风格：
  * - WORD：关键字/标识符
- * - STRING：单引号字符串，支持 '' 转义
+ * - STRING：单引号字符串，支持转义
  * - 反引号/双引号在词法阶段已展开为 WORD 文本
  */
 struct Token {
@@ -22,6 +22,10 @@ struct Token {
         STRING,   // 字符串字面量
         NUMBER,   // 数字字面量
         EQ,       // 等号
+        DOT,      // 点号（限定列名）
+        PLUS,     // +
+        MINUS,    // -（减法，负数字面量仍用 NUMBER）
+        SLASH,    // /
         COMMA,    // 逗号
         LPAREN,   // 左括号
         RPAREN,   // 右括号

@@ -2,6 +2,8 @@
 #define AST_H
 
 #include "Schema.h"
+#include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -149,16 +151,110 @@ struct InsertStmt {
     std::vector<std::string> values;  // 插入的值
 };
 
+/** SQL 表达式（WHERE / ON / SELECT 列表） */
+struct QueryExpr;
+
+using QueryExprPtr = std::unique_ptr<QueryExpr>;
+
+struct QLiteral {
+    Cell value{};
+};
+
+struct QColumnRef {
+    std::optional<std::string> table; // 表或别名限定；未限定时按列名唯一解析
+    std::string name;
+};
+
+struct QUnary {
+    enum class Op { Not };
+    Op op = Op::Not;
+    QueryExprPtr child;
+};
+
+struct QBinary {
+    std::string op; // =, <>, !=, <, <=, >, >=, AND, OR, +, -, *, /
+    QueryExprPtr left;
+    QueryExprPtr right;
+};
+
+struct QCall {
+    std::string name;
+    std::vector<QueryExprPtr> args;
+    /** COUNT(*) 时为 true（args 为空） */
+    bool countStar = false;
+};
+
+/** IN (SELECT ...) 或 IN (字面量,...)；subquerySql 与 inValues 二选一 */
+struct QInSubquery {
+    QueryExprPtr left;
+    std::string subquerySql;
+    std::vector<Cell> inValues;
+    bool notIn = false;
+};
+
+struct QExistsSubquery {
+    std::string subquerySql;
+    bool notExists = false;
+};
+
+struct QueryExpr {
+    std::variant<QLiteral, QColumnRef, QUnary, QBinary, QCall, QInSubquery, QExistsSubquery> node;
+};
+
+enum class SelectItemKind { Star, Expr };
+
+struct SelectItem {
+    SelectItemKind kind = SelectItemKind::Expr;
+    std::optional<std::string> starTable; // t.* 时的 t
+    QueryExprPtr expr;
+    std::string outputAlias; // AS 别名，可空
+};
+
+enum class JoinKind { Inner, Left };
+
+/**
+ * FROM / JOIN：joinOn 为空表示与左侧叉积（逗号）；非空为 JOIN ... ON
+ */
+struct FromTableSpec {
+    std::string table;
+    std::string alias; // 空表示逻辑名使用 table
+    QueryExprPtr joinOn;
+    JoinKind joinKind = JoinKind::Inner;
+};
+
+struct OrderByTerm {
+    QueryExprPtr expr;
+    bool descending = false;
+};
+
 /**
  * 查询语句
- * 例如：SELECT * FROM student WHERE id = 1;
  */
 struct SelectStmt {
-    bool selectAll = false;           // 是否查询所有列
-    std::vector<std::string> columns; // 查询的列名
-    std::string table;                // 表名
-    std::string whereColumn;          // WHERE 条件列
-    std::string whereValue;           // WHERE 条件值
+    bool distinct = false; // SELECT DISTINCT
+    std::vector<SelectItem> selectList;
+    std::vector<FromTableSpec> from;
+    QueryExprPtr where;
+    std::vector<QueryExprPtr> groupBy;
+    QueryExprPtr having;
+    std::vector<OrderByTerm> orderBy;
+    std::optional<std::int64_t> limit;
+    std::optional<std::int64_t> offset;
+};
+
+/** 集合运算：UNION / INTERSECT / EXCEPT，可选 ALL */
+enum class SetOperator { Union, Intersect, Except };
+
+/**
+ * 复合查询：多臂 SELECT 用集合运算连接；单臂时与一条 SelectStmt 等价
+ */
+struct CompoundSelectStmt {
+    std::vector<SelectStmt> arms;
+    /// ops[i] 连接 arms[i] 与 arms[i+1]；长度为 arms.size()-1
+    std::vector<std::pair<SetOperator, bool>> ops;
+    std::vector<OrderByTerm> compoundOrderBy;
+    std::optional<std::int64_t> compoundLimit;
+    std::optional<std::int64_t> compoundOffset;
 };
 
 /**
@@ -285,7 +381,7 @@ struct ShowAuditLogStmt {
  * 包含所有支持的 SQL 语句类型
  */
 using Stmt = std::variant<ConnectStmt, CreateDatabaseStmt, DropDatabaseStmt, ShowDatabasesStmt, ShowTablesStmt, DescribeStmt,
-                            DropTableStmt, AlterTableStmt, CreateTableStmt, InsertStmt, SelectStmt, DeleteStmt, UpdateStmt,
+                            DropTableStmt, AlterTableStmt, CreateTableStmt, InsertStmt, CompoundSelectStmt, DeleteStmt, UpdateStmt,
                             CreateUserStmt, DropUserStmt, ShowUsersStmt, LoginStmt, LogoutStmt,
                             CreateRoleStmt, DropRoleStmt, GrantStmt, RevokeStmt, ShowGrantsStmt, ShowAuditLogStmt>;
 

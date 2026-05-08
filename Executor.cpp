@@ -6,10 +6,18 @@
 #include "Executor.h"
 #include "Ast.h"
 #include "Constraints.h"
+#include "QueryEval.h"
 #include "Schema.h"
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <iostream>
+#include <optional>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -263,6 +271,1040 @@ static bool validateUpdateIntegrity(Executor& ex, const std::string& db, Table& 
             return false;
         }
     }
+    return true;
+}
+
+static bool logicalNameMatch(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validateFromJoinModes(const std::vector<ast::FromTableSpec>& from, std::string& err) {
+    if (from.empty()) {
+        err = "FROM 不能为空";
+        return false;
+    }
+    if (from.size() > 1) {
+        bool joinMode = static_cast<bool>(from[1].joinOn);
+        for (size_t i = 1; i < from.size(); ++i) {
+            if (static_cast<bool>(from[i].joinOn) != joinMode) {
+                err = "FROM 子句混合了逗号连接与 JOIN";
+                return false;
+            }
+        }
+        if (joinMode) {
+            for (size_t i = 1; i < from.size(); ++i) {
+                if (!from[i].joinOn) {
+                    err = "JOIN 缺少 ON";
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static void printResultGrid(const std::vector<std::string>& headers,
+                            const std::vector<std::vector<std::optional<Cell>>>& rows) {
+    for (size_t i = 0; i < headers.size(); ++i) {
+        if (i > 0) {
+            std::cout << " | ";
+        }
+        std::cout << headers[i];
+    }
+    std::cout << "\n";
+    for (const auto& r : rows) {
+        for (size_t i = 0; i < r.size(); ++i) {
+            if (i > 0) {
+                std::cout << " | ";
+            }
+            std::cout << cellToString(r[i]);
+        }
+        std::cout << "\n";
+    }
+    std::cout << "(" << rows.size() << " rows)\n";
+}
+
+static QueryRowContext buildPrefixCtx(Executor& ex, const std::vector<ast::FromTableSpec>& from,
+                                      const std::vector<size_t>& idxs, size_t lastInclusive) {
+    QueryRowContext ctx;
+    for (size_t i = 0; i <= lastInclusive && i < from.size(); ++i) {
+        Table& tab = ex.loadTable(from[i].table);
+        ctx.tables.push_back(&tab);
+        ctx.rowIndices.push_back(idxs[i]);
+        ctx.logicalNames.push_back(from[i].alias.empty() ? from[i].table : from[i].alias);
+    }
+    return ctx;
+}
+
+static QueryRowContext buildFullCtx(Executor& ex, const std::vector<ast::FromTableSpec>& from,
+                                    const std::vector<size_t>& idxs) {
+    return buildPrefixCtx(ex, from, idxs, from.empty() ? 0 : from.size() - 1);
+}
+
+static QueryRowContext mergeContexts(const QueryRowContext* outer, QueryRowContext inner) {
+    if (!outer) {
+        return inner;
+    }
+    QueryRowContext m = *outer;
+    m.tables.insert(m.tables.end(), inner.tables.begin(), inner.tables.end());
+    m.rowIndices.insert(m.rowIndices.end(), inner.rowIndices.begin(), inner.rowIndices.end());
+    m.logicalNames.insert(m.logicalNames.end(), inner.logicalNames.begin(), inner.logicalNames.end());
+    return m;
+}
+
+static void dfsJoinContexts(Executor& ex, const std::vector<ast::FromTableSpec>& from, const ast::QueryExpr* where,
+                            const QueryRowContext* outer, size_t depth, std::vector<size_t>& idxs,
+                            std::vector<QueryRowContext>& out, std::string& err, bool& ok, SubqueryRunner* sub) {
+    if (!ok) {
+        return;
+    }
+    if (depth == from.size()) {
+        QueryRowContext inner = buildFullCtx(ex, from, idxs);
+        QueryRowContext merged = mergeContexts(outer, std::move(inner));
+        if (where) {
+            bool wb = false;
+            if (!evalQueryExprBool(*where, merged, wb, err, sub)) {
+                ok = false;
+                return;
+            }
+            if (!wb) {
+                return;
+            }
+        }
+        out.push_back(std::move(merged));
+        return;
+    }
+    Table& tab = ex.loadTable(from[depth].table);
+    const auto& recs = tab.getRecords();
+    if (depth > 0 && from[depth].joinOn) {
+        std::vector<size_t> matched;
+        for (size_t ri = 0; ri < recs.size(); ++ri) {
+            idxs[depth] = ri;
+            QueryRowContext pctx = buildPrefixCtx(ex, from, idxs, depth);
+            bool jb = false;
+            if (!evalQueryExprBool(*from[depth].joinOn, pctx, jb, err, sub)) {
+                ok = false;
+                return;
+            }
+            if (jb) {
+                matched.push_back(ri);
+            }
+        }
+        if (matched.empty() && from[depth].joinKind == ast::JoinKind::Left) {
+            idxs[depth] = kNullRowIndex;
+            dfsJoinContexts(ex, from, where, outer, depth + 1, idxs, out, err, ok, sub);
+        } else {
+            for (size_t ri : matched) {
+                idxs[depth] = ri;
+                dfsJoinContexts(ex, from, where, outer, depth + 1, idxs, out, err, ok, sub);
+            }
+        }
+        return;
+    }
+    for (size_t ri = 0; ri < recs.size(); ++ri) {
+        idxs[depth] = ri;
+        dfsJoinContexts(ex, from, where, outer, depth + 1, idxs, out, err, ok, sub);
+    }
+}
+
+static bool selectHasStar(const ast::SelectStmt& s) {
+    for (const auto& it : s.selectList) {
+        if (it.kind == ast::SelectItemKind::Star) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool selectListHasAggregate(const ast::SelectStmt& s) {
+    for (const auto& it : s.selectList) {
+        if (it.kind == ast::SelectItemKind::Expr && it.expr && exprContainsAggregate(*it.expr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool projectDataRow(Executor& ex, const ast::SelectStmt& s, const QueryRowContext& ctx,
+                           const std::vector<QueryRowContext>* groupBucket, std::vector<std::optional<Cell>>& row,
+                           std::string& err, SubqueryRunner* sub) {
+    row.clear();
+    for (const auto& it : s.selectList) {
+        if (it.kind == ast::SelectItemKind::Star) {
+            if (it.starTable.has_value()) {
+                size_t ti = static_cast<size_t>(-1);
+                for (size_t i = 0; i < s.from.size(); ++i) {
+                    std::string log = s.from[i].alias.empty() ? s.from[i].table : s.from[i].alias;
+                    if (logicalNameMatch(log, *it.starTable)) {
+                        ti = i;
+                        break;
+                    }
+                }
+                if (ti == static_cast<size_t>(-1)) {
+                    err = "未知表或别名: " + *it.starTable;
+                    return false;
+                }
+                Table& t = ex.loadTable(s.from[ti].table);
+                const auto& recs = t.getRecords();
+                size_t ri = ctx.rowIndices[ti];
+                if (ri == kNullRowIndex) {
+                    for (size_t k = 0; k < t.getSchema().size(); ++k) {
+                        row.push_back(std::nullopt);
+                    }
+                } else {
+                    if (ri >= recs.size()) {
+                        err = "行越界";
+                        return false;
+                    }
+                    for (const auto& c : recs[ri].cells) {
+                        row.push_back(c);
+                    }
+                }
+            } else {
+                for (size_t ti = 0; ti < s.from.size(); ++ti) {
+                    Table& t = ex.loadTable(s.from[ti].table);
+                    const auto& recs = t.getRecords();
+                    size_t ri = ctx.rowIndices[ti];
+                    if (ri == kNullRowIndex) {
+                        for (size_t k = 0; k < t.getSchema().size(); ++k) {
+                            row.push_back(std::nullopt);
+                        }
+                    } else {
+                        if (ri >= recs.size()) {
+                            err = "行越界";
+                            return false;
+                        }
+                        for (const auto& c : recs[ri].cells) {
+                            row.push_back(c);
+                        }
+                    }
+                }
+            }
+        } else {
+            if (!it.expr) {
+                err = "缺少表达式";
+                return false;
+            }
+            std::optional<Cell> c;
+            SqlType st{};
+            if (groupBucket) {
+                if (exprContainsAggregate(*it.expr)) {
+                    if (!evalAggregateExpr(*it.expr, *groupBucket, c, st, err)) {
+                        return false;
+                    }
+                } else {
+                    if (groupBucket->empty()) {
+                        err = "无匹配行时 SELECT 列表不能包含非聚合表达式";
+                        return false;
+                    }
+                    if (!evalQueryExprScalar(*it.expr, (*groupBucket)[0], c, st, err, sub)) {
+                        return false;
+                    }
+                }
+            } else {
+                if (!evalQueryExprScalar(*it.expr, ctx, c, st, err, sub)) {
+                    return false;
+                }
+            }
+            row.push_back(std::move(c));
+        }
+    }
+    return true;
+}
+
+static bool havingPredicateCompare(const std::string& op, const std::optional<Cell>& a, const std::optional<Cell>& b,
+                                   bool& out) {
+    if (!a.has_value() || !b.has_value()) {
+        out = false;
+        return true;
+    }
+    if (op == "=" || op == "==") {
+        auto c = cellCompareLoose(*a, *b);
+        if (!c.has_value()) {
+            return false;
+        }
+        out = (*c == 0);
+        return true;
+    }
+    if (op == "<>" || op == "!=") {
+        auto c = cellCompareLoose(*a, *b);
+        if (!c.has_value()) {
+            return false;
+        }
+        out = (*c != 0);
+        return true;
+    }
+    auto c = cellCompareLoose(*a, *b);
+    if (!c.has_value()) {
+        return false;
+    }
+    int v = *c;
+    if (op == "<") {
+        out = (v < 0);
+        return true;
+    }
+    if (op == "<=") {
+        out = (v <= 0);
+        return true;
+    }
+    if (op == ">") {
+        out = (v > 0);
+        return true;
+    }
+    if (op == ">=") {
+        out = (v >= 0);
+        return true;
+    }
+    return false;
+}
+
+static std::string groupKeyForCtx(const ast::SelectStmt& s, const QueryRowContext& ctx, std::string& err) {
+    std::string key;
+    for (const auto& ge : s.groupBy) {
+        std::optional<Cell> c;
+        SqlType st{};
+        if (!evalQueryExprScalar(*ge, ctx, c, st, err, nullptr)) {
+            return "";
+        }
+        key += "|" + cellToString(c);
+    }
+    return key;
+}
+
+static bool evalHavingGroup(const ast::QueryExpr& e, const std::vector<QueryRowContext>& bucket, bool& out,
+                            std::string& err, SubqueryRunner* sub) {
+    return std::visit(
+        [&](const auto& alt) -> bool {
+            using T = std::decay_t<decltype(alt)>;
+            if constexpr (std::is_same_v<T, ast::QUnary>) {
+                if (alt.op != ast::QUnary::Op::Not) {
+                    err = "HAVING 不支持该运算符";
+                    return false;
+                }
+                bool inner = false;
+                if (!evalHavingGroup(*alt.child, bucket, inner, err, sub)) {
+                    return false;
+                }
+                out = !inner;
+                return true;
+            } else if constexpr (std::is_same_v<T, ast::QBinary>) {
+                if (alt.op == "AND") {
+                    bool a = false;
+                    if (!evalHavingGroup(*alt.left, bucket, a, err, sub)) {
+                        return false;
+                    }
+                    if (!a) {
+                        out = false;
+                        return true;
+                    }
+                    return evalHavingGroup(*alt.right, bucket, out, err, sub);
+                }
+                if (alt.op == "OR") {
+                    bool a = false;
+                    if (!evalHavingGroup(*alt.left, bucket, a, err, sub)) {
+                        return false;
+                    }
+                    if (a) {
+                        out = true;
+                        return true;
+                    }
+                    return evalHavingGroup(*alt.right, bucket, out, err, sub);
+                }
+                std::optional<Cell> l;
+                std::optional<Cell> r;
+                SqlType lt{};
+                SqlType rt{};
+                QueryRowContext emptyCtx;
+                const QueryRowContext& scalarCtx = bucket.empty() ? emptyCtx : bucket[0];
+                if (exprContainsAggregate(*alt.left)) {
+                    if (!evalAggregateExpr(*alt.left, bucket, l, lt, err)) {
+                        return false;
+                    }
+                } else {
+                    if (!evalQueryExprScalar(*alt.left, scalarCtx, l, lt, err, sub)) {
+                        return false;
+                    }
+                }
+                if (exprContainsAggregate(*alt.right)) {
+                    if (!evalAggregateExpr(*alt.right, bucket, r, rt, err)) {
+                        return false;
+                    }
+                } else {
+                    if (!evalQueryExprScalar(*alt.right, scalarCtx, r, rt, err, sub)) {
+                        return false;
+                    }
+                }
+                bool res = false;
+                if (!havingPredicateCompare(alt.op, l, r, res)) {
+                    err = "HAVING 比较失败";
+                    return false;
+                }
+                out = res;
+                return true;
+            }
+            err = "HAVING 仅支持 AND/OR/NOT 与比较表达式";
+            return false;
+        },
+        e.node);
+}
+
+static int compareOptionalCellsLoose(const std::optional<Cell>& a, const std::optional<Cell>& b) {
+    if (!a.has_value() && !b.has_value()) {
+        return 0;
+    }
+    if (!a.has_value()) {
+        return -1;
+    }
+    if (!b.has_value()) {
+        return 1;
+    }
+    auto c = cellCompareLoose(*a, *b);
+    if (!c.has_value()) {
+        return 0;
+    }
+    return *c;
+}
+
+struct ExecSubqueryRunner : SubqueryRunner {
+    Executor& ex;
+    std::string db;
+
+    ExecSubqueryRunner(Executor& e, std::string d) : ex(e), db(std::move(d)) {}
+
+    bool evalExists(const std::string& selectSql, const QueryRowContext* outer, bool notExists, bool& out,
+                    std::string& err) override {
+        Parser p;
+        ParseResult pr = p.parse(selectSql);
+        if (!pr.errorMsg.empty() || !pr.stmt.has_value()) {
+            err = "子查询解析失败: " + pr.errorMsg;
+            return false;
+        }
+        auto* compound = std::get_if<ast::CompoundSelectStmt>(&*pr.stmt);
+        if (!compound || compound->arms.size() != 1) {
+            err = "EXISTS 子查询须为单条 SELECT（不支持 UNION 等）";
+            return false;
+        }
+        const ast::SelectStmt& sub = compound->arms[0];
+        std::string verr;
+        if (!validateFromJoinModes(sub.from, verr)) {
+            err = verr;
+            return false;
+        }
+        for (const auto& f : sub.from) {
+            if (!FileManager::tableExists(db, f.table)) {
+                err = "子查询表不存在: " + f.table;
+                return false;
+            }
+        }
+        std::vector<QueryRowContext> ctxs;
+        std::vector<size_t> idxs(sub.from.size(), 0);
+        bool ok = true;
+        dfsJoinContexts(ex, sub.from, sub.where.get(), outer, 0, idxs, ctxs, err, ok, this);
+        if (!ok) {
+            return false;
+        }
+        bool any = !ctxs.empty();
+        out = notExists ? !any : any;
+        return true;
+    }
+
+    bool evalIn(const std::string& selectSql, const QueryRowContext* outer, const Cell& left, bool notIn, bool& out,
+                std::string& err) override {
+        Parser p;
+        ParseResult pr = p.parse(selectSql);
+        if (!pr.errorMsg.empty() || !pr.stmt.has_value()) {
+            err = "子查询解析失败: " + pr.errorMsg;
+            return false;
+        }
+        auto* compound = std::get_if<ast::CompoundSelectStmt>(&*pr.stmt);
+        if (!compound || compound->arms.size() != 1) {
+            err = "IN 子查询须为单条 SELECT（不支持 UNION 等）";
+            return false;
+        }
+        const ast::SelectStmt& sub = compound->arms[0];
+        if (selectHasStar(sub) || sub.selectList.size() != 1 || sub.selectList[0].kind != ast::SelectItemKind::Expr) {
+            err = "IN 子查询必须恰好返回一列（不使用 *）";
+            return false;
+        }
+        std::string verr;
+        if (!validateFromJoinModes(sub.from, verr)) {
+            err = verr;
+            return false;
+        }
+        for (const auto& f : sub.from) {
+            if (!FileManager::tableExists(db, f.table)) {
+                err = "子查询表不存在: " + f.table;
+                return false;
+            }
+        }
+        std::vector<QueryRowContext> ctxs;
+        std::vector<size_t> idxs(sub.from.size(), 0);
+        bool ok = true;
+        dfsJoinContexts(ex, sub.from, sub.where.get(), outer, 0, idxs, ctxs, err, ok, this);
+        if (!ok) {
+            return false;
+        }
+        bool found = false;
+        for (const auto& cx : ctxs) {
+            std::optional<Cell> v;
+            SqlType st{};
+            if (!evalQueryExprScalar(*sub.selectList[0].expr, cx, v, st, err, this)) {
+                return false;
+            }
+            if (!v.has_value()) {
+                continue;
+            }
+            auto cmp = cellCompareLoose(left, *v);
+            if (!cmp.has_value()) {
+                err = "IN 子查询比较类型不兼容";
+                return false;
+            }
+            if (*cmp == 0) {
+                found = true;
+                break;
+            }
+        }
+        out = notIn ? !found : found;
+        return true;
+    }
+};
+
+static bool buildSelectHeaders(Executor& ex, const ast::SelectStmt& s, std::vector<std::string>& headers,
+                               std::string& err) {
+    headers.clear();
+    int anon = 0;
+    for (const auto& it : s.selectList) {
+        if (it.kind == ast::SelectItemKind::Star) {
+            if (it.starTable.has_value()) {
+                size_t ti = static_cast<size_t>(-1);
+                for (size_t i = 0; i < s.from.size(); ++i) {
+                    std::string log = s.from[i].alias.empty() ? s.from[i].table : s.from[i].alias;
+                    if (logicalNameMatch(log, *it.starTable)) {
+                        ti = i;
+                        break;
+                    }
+                }
+                if (ti == static_cast<size_t>(-1)) {
+                    err = "未知表或别名: " + *it.starTable;
+                    return false;
+                }
+                Table& t = ex.loadTable(s.from[ti].table);
+                std::string pfx = s.from[ti].alias.empty() ? s.from[ti].table : s.from[ti].alias;
+                for (const auto& cn : t.getColumnNames()) {
+                    headers.push_back(pfx + "." + cn);
+                }
+            } else {
+                for (size_t ti = 0; ti < s.from.size(); ++ti) {
+                    Table& t = ex.loadTable(s.from[ti].table);
+                    std::string pfx = s.from[ti].alias.empty() ? s.from[ti].table : s.from[ti].alias;
+                    for (const auto& cn : t.getColumnNames()) {
+                        headers.push_back(pfx + "." + cn);
+                    }
+                }
+            }
+        } else {
+            if (!it.expr) {
+                err = "缺少表达式";
+                return false;
+            }
+            if (!it.outputAlias.empty()) {
+                headers.push_back(it.outputAlias);
+            } else if (std::holds_alternative<ast::QColumnRef>(it.expr->node)) {
+                const auto& cr = std::get<ast::QColumnRef>(it.expr->node);
+                if (cr.table.has_value()) {
+                    headers.push_back(*cr.table + "." + cr.name);
+                } else {
+                    headers.push_back(cr.name);
+                }
+            } else {
+                headers.push_back("expr" + std::to_string(++anon));
+            }
+        }
+    }
+    return true;
+}
+
+static std::string rowFingerprintCells(const std::vector<std::optional<Cell>>& row) {
+    std::string s;
+    for (const auto& c : row) {
+        s.push_back('\x1E');
+        s += cellToString(c);
+    }
+    return s;
+}
+
+static std::vector<std::vector<std::optional<Cell>>> dedupeRowsStable(
+    const std::vector<std::vector<std::optional<Cell>>>& in) {
+    std::unordered_set<std::string> seen;
+    std::vector<std::vector<std::optional<Cell>>> out;
+    for (const auto& r : in) {
+        std::string k = rowFingerprintCells(r);
+        if (seen.insert(k).second) {
+            out.push_back(r);
+        }
+    }
+    return out;
+}
+
+static std::unordered_map<std::string, std::pair<std::vector<std::optional<Cell>>, int>> countRowsByKey(
+    const std::vector<std::vector<std::optional<Cell>>>& rows) {
+    std::unordered_map<std::string, std::pair<std::vector<std::optional<Cell>>, int>> m;
+    for (const auto& r : rows) {
+        std::string k = rowFingerprintCells(r);
+        auto it = m.find(k);
+        if (it == m.end()) {
+            m[k] = {r, 1};
+        } else {
+            it->second.second++;
+        }
+    }
+    return m;
+}
+
+static std::vector<std::vector<std::optional<Cell>>> applySetOperator(
+    const std::vector<std::vector<std::optional<Cell>>>& a,
+    const std::vector<std::vector<std::optional<Cell>>>& b,
+    ast::SetOperator op,
+    bool all) {
+    auto concatDedupe = [&](const std::vector<std::vector<std::optional<Cell>>>& x,
+                            const std::vector<std::vector<std::optional<Cell>>>& y) {
+        std::vector<std::vector<std::optional<Cell>>> cat = x;
+        cat.insert(cat.end(), y.begin(), y.end());
+        return dedupeRowsStable(cat);
+    };
+    switch (op) {
+    case ast::SetOperator::Union:
+        if (all) {
+            std::vector<std::vector<std::optional<Cell>>> out = a;
+            out.insert(out.end(), b.begin(), b.end());
+            return out;
+        }
+        return concatDedupe(a, b);
+    case ast::SetOperator::Intersect: {
+        if (all) {
+            auto ma = countRowsByKey(a);
+            auto mb = countRowsByKey(b);
+            std::vector<std::vector<std::optional<Cell>>> out;
+            for (const auto& [k, pa] : ma) {
+                auto itb = mb.find(k);
+                if (itb == mb.end()) {
+                    continue;
+                }
+                int n = std::min(pa.second, itb->second.second);
+                for (int i = 0; i < n; ++i) {
+                    out.push_back(pa.first);
+                }
+            }
+            return out;
+        }
+        auto da = dedupeRowsStable(a);
+        auto db = dedupeRowsStable(b);
+        std::unordered_set<std::string> sb;
+        for (const auto& r : db) {
+            sb.insert(rowFingerprintCells(r));
+        }
+        std::vector<std::vector<std::optional<Cell>>> out;
+        for (const auto& r : da) {
+            if (sb.count(rowFingerprintCells(r))) {
+                out.push_back(r);
+            }
+        }
+        return out;
+    }
+    case ast::SetOperator::Except: {
+        if (all) {
+            auto ma = countRowsByKey(a);
+            auto mb = countRowsByKey(b);
+            std::vector<std::vector<std::optional<Cell>>> out;
+            for (auto& [k, pa] : ma) {
+                int sub = 0;
+                auto itb = mb.find(k);
+                if (itb != mb.end()) {
+                    sub = itb->second.second;
+                }
+                int rem = pa.second - sub;
+                for (int i = 0; i < rem; ++i) {
+                    out.push_back(pa.first);
+                }
+            }
+            return out;
+        }
+        auto da = dedupeRowsStable(a);
+        auto db = dedupeRowsStable(b);
+        std::unordered_set<std::string> sb;
+        for (const auto& r : db) {
+            sb.insert(rowFingerprintCells(r));
+        }
+        std::vector<std::vector<std::optional<Cell>>> out;
+        for (const auto& r : da) {
+            if (!sb.count(rowFingerprintCells(r))) {
+                out.push_back(r);
+            }
+        }
+        return out;
+    }
+    }
+    return a;
+}
+
+static bool resolveOrderColumnIndex(const ast::QueryExpr& e, const std::vector<std::string>& headers, size_t& outCol,
+                                    std::string& err) {
+    return std::visit(
+        [&](const auto& alt) -> bool {
+            using T = std::decay_t<decltype(alt)>;
+            if constexpr (std::is_same_v<T, ast::QLiteral>) {
+                const Cell& cv = alt.value;
+                std::int64_t ord = 0;
+                if (std::holds_alternative<std::int64_t>(cv)) {
+                    ord = std::get<std::int64_t>(cv);
+                } else if (std::holds_alternative<double>(cv)) {
+                    double d = std::get<double>(cv);
+                    if (d != std::floor(d)) {
+                        err = "ORDER BY 列序号须为整数";
+                        return false;
+                    }
+                    ord = static_cast<std::int64_t>(d);
+                } else {
+                    err = "复合查询 ORDER BY 须为列序号(1..n)或列名";
+                    return false;
+                }
+                if (ord < 1 || static_cast<size_t>(ord) > headers.size()) {
+                    err = "ORDER BY 列序号越界";
+                    return false;
+                }
+                outCol = static_cast<size_t>(ord - 1);
+                return true;
+            }
+            if constexpr (std::is_same_v<T, ast::QColumnRef>) {
+                for (size_t i = 0; i < headers.size(); ++i) {
+                    if (alt.table.has_value()) {
+                        std::string qual = *alt.table + "." + alt.name;
+                        if (logicalNameMatch(headers[i], qual)) {
+                            outCol = i;
+                            return true;
+                        }
+                    } else {
+                        auto dot = headers[i].rfind('.');
+                        std::string shortName = (dot == std::string::npos) ? headers[i] : headers[i].substr(dot + 1);
+                        if (logicalNameMatch(shortName, alt.name)) {
+                            outCol = i;
+                            return true;
+                        }
+                    }
+                }
+                err = "ORDER BY 未找到列";
+                return false;
+            }
+            err = "复合查询 ORDER BY 仅支持列序号或简单列名";
+            return false;
+        },
+        e.node);
+}
+
+static bool sortCompoundResultGrid(std::vector<std::vector<std::optional<Cell>>>& grid,
+                                   const std::vector<std::string>& headers,
+                                   const std::vector<ast::OrderByTerm>& orderBy,
+                                   std::string& err) {
+    if (orderBy.empty()) {
+        return true;
+    }
+    std::vector<std::pair<size_t, bool>> ord;
+    for (const auto& ob : orderBy) {
+        if (!ob.expr) {
+            continue;
+        }
+        size_t col = 0;
+        if (!resolveOrderColumnIndex(*ob.expr, headers, col, err)) {
+            return false;
+        }
+        ord.push_back({col, ob.descending});
+    }
+    if (ord.empty()) {
+        return true;
+    }
+    std::stable_sort(grid.begin(), grid.end(),
+                     [&](const std::vector<std::optional<Cell>>& a, const std::vector<std::optional<Cell>>& b) -> bool {
+                         for (const auto& [col, desc] : ord) {
+                             if (col >= a.size() || col >= b.size()) {
+                                 return false;
+                             }
+                             int cmp = compareOptionalCellsLoose(a[col], b[col]);
+                             if (cmp != 0) {
+                                 return desc ? (cmp > 0) : (cmp < 0);
+                             }
+                         }
+                         return false;
+                     });
+    return true;
+}
+
+static void applyCompoundLimit(std::vector<std::vector<std::optional<Cell>>>& grid,
+                               std::optional<std::int64_t> limit,
+                               std::optional<std::int64_t> offset) {
+    std::int64_t off64 = offset.value_or(0);
+    if (off64 < 0) {
+        off64 = 0;
+    }
+    size_t off = static_cast<size_t>(off64);
+    size_t n = grid.size();
+    if (off > n) {
+        off = n;
+    }
+    size_t end = n;
+    if (limit.has_value()) {
+        std::int64_t lim = *limit;
+        if (lim < 0) {
+            lim = 0;
+        }
+        end = std::min(n, off + static_cast<size_t>(lim));
+    }
+    std::vector<std::vector<std::optional<Cell>>> sliced;
+    sliced.reserve(end - off);
+    for (size_t i = off; i < end; ++i) {
+        sliced.push_back(std::move(grid[i]));
+    }
+    grid = std::move(sliced);
+}
+
+struct ResultSortRow {
+    QueryRowContext ctx;
+    std::optional<std::vector<QueryRowContext>> bucket;
+    std::vector<std::optional<Cell>> cells;
+};
+
+static bool evaluateSelectStmtGrid(Executor& ex, const std::string& db, const ast::SelectStmt& s,
+                                   std::vector<std::string>& headers,
+                                   std::vector<std::vector<std::optional<Cell>>>& outGrid,
+                                   std::string& err) {
+    err.clear();
+    if (!validateFromJoinModes(s.from, err)) {
+        return false;
+    }
+    if (!s.groupBy.empty() && selectHasStar(s)) {
+        err = "GROUP BY 时不能使用 *";
+        return false;
+    }
+    std::unordered_set<std::string> seen;
+    for (const auto& f : s.from) {
+        std::string n = f.alias.empty() ? f.table : f.alias;
+        std::string u = n;
+        for (auto& c : u) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        if (seen.count(u)) {
+            err = "表别名重复: " + n;
+            return false;
+        }
+        seen.insert(std::move(u));
+    }
+    for (const auto& f : s.from) {
+        if (!FileManager::tableExists(db, f.table)) {
+            err = "Table not found: " + f.table;
+            return false;
+        }
+    }
+    if (!buildSelectHeaders(ex, s, headers, err)) {
+        return false;
+    }
+    ExecSubqueryRunner runner(ex, db);
+    std::vector<QueryRowContext> raw;
+    std::vector<size_t> idxs(s.from.size(), 0);
+    bool ok = true;
+    dfsJoinContexts(ex, s.from, s.where.get(), nullptr, 0, idxs, raw, err, ok, &runner);
+    if (!ok) {
+        return false;
+    }
+
+    std::vector<ResultSortRow> result;
+    const bool needGroup = !s.groupBy.empty() || selectListHasAggregate(s);
+    if (needGroup) {
+        std::unordered_map<std::string, std::vector<QueryRowContext>> buckets;
+        if (s.groupBy.empty()) {
+            buckets[""] = std::move(raw);
+        } else {
+            for (const auto& cx : raw) {
+                std::string k = groupKeyForCtx(s, cx, err);
+                if (k.empty() && !err.empty()) {
+                    return false;
+                }
+                buckets[k].push_back(cx);
+            }
+        }
+        for (auto& kv : buckets) {
+            auto& bucket = kv.second;
+            if (s.having) {
+                bool hb = false;
+                if (!evalHavingGroup(*s.having, bucket, hb, err, &runner)) {
+                    return false;
+                }
+                if (!hb) {
+                    continue;
+                }
+            }
+            ResultSortRow gr;
+            gr.ctx = bucket.empty() ? QueryRowContext{} : bucket[0];
+            gr.bucket = std::move(bucket);
+            if (!projectDataRow(ex, s, gr.ctx, &*gr.bucket, gr.cells, err, &runner)) {
+                return false;
+            }
+            result.push_back(std::move(gr));
+        }
+    } else {
+        for (const auto& cx : raw) {
+            ResultSortRow gr;
+            gr.ctx = cx;
+            if (!projectDataRow(ex, s, cx, nullptr, gr.cells, err, &runner)) {
+                return false;
+            }
+            result.push_back(std::move(gr));
+        }
+    }
+
+    if (s.distinct) {
+        std::unordered_set<std::string> dseen;
+        std::vector<ResultSortRow> deduped;
+        for (auto& r : result) {
+            std::string k = rowFingerprintCells(r.cells);
+            if (dseen.insert(k).second) {
+                deduped.push_back(std::move(r));
+            }
+        }
+        result = std::move(deduped);
+    }
+
+    if (!s.orderBy.empty()) {
+        bool sortErr = false;
+        std::stable_sort(result.begin(), result.end(),
+                         [&](const ResultSortRow& a, const ResultSortRow& b) -> bool {
+                             if (sortErr) {
+                                 return false;
+                             }
+                             for (const auto& ob : s.orderBy) {
+                                 if (!ob.expr) {
+                                     continue;
+                                 }
+                                 std::optional<Cell> va;
+                                 std::optional<Cell> vb;
+                                 SqlType sta{};
+                                 SqlType stb{};
+                                 if (a.bucket.has_value() && exprContainsAggregate(*ob.expr)) {
+                                     if (!evalAggregateExpr(*ob.expr, *a.bucket, va, sta, err)) {
+                                         sortErr = true;
+                                         return false;
+                                     }
+                                 } else {
+                                     if (!evalQueryExprScalar(*ob.expr, a.ctx, va, sta, err, &runner)) {
+                                         sortErr = true;
+                                         return false;
+                                     }
+                                 }
+                                 if (b.bucket.has_value() && exprContainsAggregate(*ob.expr)) {
+                                     if (!evalAggregateExpr(*ob.expr, *b.bucket, vb, stb, err)) {
+                                         sortErr = true;
+                                         return false;
+                                     }
+                                 } else {
+                                     if (!evalQueryExprScalar(*ob.expr, b.ctx, vb, stb, err, &runner)) {
+                                         sortErr = true;
+                                         return false;
+                                     }
+                                 }
+                                 int cmp = compareOptionalCellsLoose(va, vb);
+                                 if (cmp != 0) {
+                                     return ob.descending ? (cmp > 0) : (cmp < 0);
+                                 }
+                             }
+                             return false;
+                         });
+        if (sortErr) {
+            return false;
+        }
+    }
+
+    std::int64_t off64 = s.offset.value_or(0);
+    if (off64 < 0) {
+        off64 = 0;
+    }
+    size_t off = static_cast<size_t>(off64);
+    size_t n = result.size();
+    if (off > n) {
+        off = n;
+    }
+    size_t end = n;
+    if (s.limit.has_value()) {
+        std::int64_t lim = *s.limit;
+        if (lim < 0) {
+            lim = 0;
+        }
+        end = std::min(n, off + static_cast<size_t>(lim));
+    }
+    outGrid.clear();
+    outGrid.reserve(end - off);
+    for (size_t i = off; i < end; ++i) {
+        outGrid.push_back(std::move(result[i].cells));
+    }
+    return true;
+}
+
+static bool executeAdvancedSelect(Executor& ex, const std::string& db, const ast::SelectStmt& s) {
+    std::vector<std::string> headers;
+    std::vector<std::vector<std::optional<Cell>>> grid;
+    std::string err;
+    if (!evaluateSelectStmtGrid(ex, db, s, headers, grid, err)) {
+        std::cout << err << "\n";
+        return false;
+    }
+    printResultGrid(headers, grid);
+    return true;
+}
+
+static bool executeCompoundSelect(Executor& ex, const std::string& db, const ast::CompoundSelectStmt& cs) {
+    std::string err;
+    if (cs.arms.empty()) {
+        std::cout << "复合查询为空\n";
+        return false;
+    }
+    if (cs.ops.size() + 1 != cs.arms.size()) {
+        std::cout << "复合查询运算符数量错误\n";
+        return false;
+    }
+    if (cs.arms.size() == 1) {
+        return executeAdvancedSelect(ex, db, cs.arms[0]);
+    }
+    std::vector<std::string> headers;
+    std::vector<std::vector<std::optional<Cell>>> acc;
+    for (size_t i = 0; i < cs.arms.size(); ++i) {
+        std::vector<std::string> h2;
+        std::vector<std::vector<std::optional<Cell>>> g;
+        if (!evaluateSelectStmtGrid(ex, db, cs.arms[i], h2, g, err)) {
+            std::cout << err << "\n";
+            return false;
+        }
+        if (i == 0) {
+            headers = std::move(h2);
+            acc = std::move(g);
+        } else {
+            if (h2.size() != headers.size()) {
+                std::cout << "复合查询各 SELECT 的列数须一致\n";
+                return false;
+            }
+            acc = applySetOperator(acc, g, cs.ops[i - 1].first, cs.ops[i - 1].second);
+        }
+    }
+    if (!sortCompoundResultGrid(acc, headers, cs.compoundOrderBy, err)) {
+        std::cout << err << "\n";
+        return false;
+    }
+    applyCompoundLimit(acc, cs.compoundLimit, cs.compoundOffset);
+    printResultGrid(headers, acc);
     return true;
 }
 
@@ -713,26 +1755,39 @@ void Executor::execute(const ParseResult& pr) {
                 FileManager::addAuditLog(currentUser, "INSERT", s.table, "SUCCESS");
             }
 
-            // 执行 SELECT 语句
-            else if constexpr (std::is_same_v<T, ast::SelectStmt>) {
+            // 执行 SELECT / UNION / INTERSECT / EXCEPT
+            else if constexpr (std::is_same_v<T, ast::CompoundSelectStmt>) {
                 if (currentUser.empty()) {
                     std::cout << "Permission denied: please login first.\n";
                     return;
                 }
+                const auto& cs = arg;
+                std::string auditTarget;
+                std::unordered_set<std::string> tablesSeen;
+                for (const auto& arm : cs.arms) {
+                    for (const auto& f : arm.from) {
+                        tablesSeen.insert(f.table);
+                    }
+                }
+                {
+                    size_t i = 0;
+                    for (const auto& tn : tablesSeen) {
+                        if (i++ > 0) {
+                            auditTarget += ",";
+                        }
+                        auditTarget += tn;
+                    }
+                }
                 if (!FileManager::hasPrivilege(currentUser, static_cast<int>(ast::Privilege::SELECT))) {
                     std::cout << "Permission denied: you need SELECT privilege.\n";
-                    FileManager::addAuditLog(currentUser, "SELECT", arg.table, "DENIED");
+                    FileManager::addAuditLog(currentUser, "SELECT", auditTarget.empty() ? "?" : auditTarget, "DENIED");
                     return;
                 }
-                const auto& s = arg;
-                if (!FileManager::tableExists(currentDb, s.table)) {
-                    std::cout << "Table not found: " << s.table << "\n";
+                if (!executeCompoundSelect(*this, currentDb, cs)) {
+                    FileManager::addAuditLog(currentUser, "SELECT", auditTarget.empty() ? "?" : auditTarget, "FAILED");
                     return;
                 }
-                Table& t = loadTable(s.table);
-                auto rows = t.select(s.whereColumn, s.whereValue);
-                printRows(t, rows, s.selectAll ? std::vector<std::string>{} : s.columns);
-                FileManager::addAuditLog(currentUser, "SELECT", s.table, "SUCCESS");
+                FileManager::addAuditLog(currentUser, "SELECT", auditTarget.empty() ? "?" : auditTarget, "SUCCESS");
             }
             
             // 执行 DELETE 语句
