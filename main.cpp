@@ -1,4 +1,5 @@
 #include "MiniDB.h"
+#include "ApiServer.h"
 #include <iostream>
 #include <string>
 
@@ -53,8 +54,40 @@ bool endsWithSemicolon(const std::string& s) {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     setupConsoleUtf8();
+
+    bool webMode = false;
+    int  port    = 3000;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--web") {
+            webMode = true;
+        } else if (arg == "--port" && i + 1 < argc) {
+            try {
+                port = std::stoi(argv[++i]);
+            } catch (...) {
+                std::cerr << "Invalid port number.\n";
+                return 1;
+            }
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "MiniDB - Mini Database Management System\n"
+                      << "Usage: MiniDB [options]\n"
+                      << "  --web          Start web server mode\n"
+                      << "  --port <num>   Port for web server (default: 3000)\n"
+                      << "  --help, -h     Show this help\n";
+            return 0;
+        }
+    }
+
+    if (webMode) {
+        std::cout << "Starting MiniDB web server on port " << port << "...\n";
+        ApiServer server(port);
+        server.start();
+        return 0;
+    }
+
     MiniDB db;
 
     std::string line;
