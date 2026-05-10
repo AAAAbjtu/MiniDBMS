@@ -119,6 +119,14 @@ std::string ApiServer::classifyOutput(const std::string& text, bool& success) {
         success = true;
         return "table";
     }
+    // Single-column table output: header + data + "(N rows|columns)"
+    if (text.find("rows)\n") != std::string::npos ||
+        text.find("columns)\n") != std::string::npos ||
+        text.find("rows)") != std::string::npos ||
+        text.find("columns)") != std::string::npos) {
+        success = true;
+        return "table";
+    }
     success = true;
     return "info";
 }
