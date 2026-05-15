@@ -26,34 +26,6 @@ std::string readFile(const std::string& path) {
     return oss.str();
 }
 
-// Served as fallback if file not found
-const char* kFallbackHtml = R"(<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MiniDB Web Console</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9;
-       display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 40px;
-        text-align: center; max-width: 500px; width: 90%; }
-h1 { font-size: 24px; margin-bottom: 8px; color: #58a6ff; }
-p { color: #8b949e; line-height: 1.6; }
-code { background: #21262d; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
-</style>
-</head>
-<body>
-<div class="card">
-<h1>MiniDB Web Console</h1>
-<p>The web frontend file was not found.</p>
-<p>Place <code>web/index.html</code> in the project directory,<br>
-or set <code>WEB_ROOT</code> in CMake to point to the correct location.</p>
-</div>
-</body>
-</html>)";
-
 } // namespace
 
 // ---- Session helpers ----
@@ -134,19 +106,23 @@ std::string ApiServer::classifyOutput(const std::string& text, bool& success) {
 // ---- Route setup ----
 
 void ApiServer::setupRoutes() {
-    // Serve frontend
-    server_->Get("/", [this](const httplib::Request&, httplib::Response& res) {
-        std::string html;
-        // Try WEB_ROOT index.html (set by CMake)
-#ifdef WEB_ROOT
-        html = readFile(std::string(WEB_ROOT) + "/index.html");
-#endif
-        // Fallback: try relative paths
-        if (html.empty()) html = readFile("web/index.html");
-        if (html.empty()) html = readFile("../web/index.html");
-        if (html.empty()) html = kFallbackHtml;
+    // Serve static files from web/ alongside the executable
+    server_->set_mount_point("/", "./web");
 
-        res.set_content(html, "text/html");
+    // SPA fallback: for any GET request not matched by a static file,
+    // return index.html so client-side routing works on page refresh.
+    server_->set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (req.method == "GET" && res.status == 404) {
+            std::string html;
+#ifdef WEB_ROOT
+            html = readFile(std::string(WEB_ROOT) + "/index.html");
+#endif
+            if (html.empty()) html = readFile("./web/index.html");
+            if (!html.empty()) {
+                res.set_content(html, "text/html");
+                res.status = 200;
+            }
+        }
     });
 
     // POST /api/login
