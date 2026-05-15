@@ -6,6 +6,7 @@ interface Props {
   token: string
   isDark: boolean
   onSelectTable?: (db: string, table: string) => void
+  onTableClick?: (db: string, table: string) => void
 }
 
 interface ColumnInfo {
@@ -54,7 +55,7 @@ function parseDescribe(output: string): ColumnInfo[] {
   return cols
 }
 
-export default function Sidebar({ token, isDark, onSelectTable }: Props) {
+export default function Sidebar({ token, isDark, onSelectTable, onTableClick }: Props) {
   const [dbs, setDbs] = useState<DbInfo[]>([])
   const [expandedDbs, setExpandedDbs] = useState<Set<string>>(new Set())
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
@@ -159,6 +160,7 @@ export default function Sidebar({ token, isDark, onSelectTable }: Props) {
       next.delete(key)
     } else {
       next.add(key)
+      onTableClick?.(dbName, tableName)
       const db = dbs.find((d) => d.name === dbName)
       const table = db?.tables?.find((t) => t.name === tableName)
       if (table?.columns === null) fetchColumns(dbName, tableName)

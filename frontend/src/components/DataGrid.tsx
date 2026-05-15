@@ -18,48 +18,58 @@ interface ParsedTable {
   rows: string[][]
 }
 
-function parseTableOutput(output: string): ParsedTable | null {
-  const lines = output.split('\n')
-  const tableLines: string[] = []
-  for (const line of lines) {
-    if (line.includes('|')) {
-      if (line.match(/^[+-]+$/)) continue
-      tableLines.push(line)
-    }
-  }
-  if (tableLines.length === 0) return null
+function parseTableOutput(output: string, isTableType: boolean): ParsedTable | null {
+  const rawLines = output.split('\n').map((l) => l.trim()).filter((l) => l)
 
-  const headers: string[] = []
-  const allRows: string[][] = []
+  // Detect pipe-separated table
+  const hasPipes = rawLines.some((l) => l.includes('|'))
+  if (hasPipes) {
+    const tableLines = rawLines.filter((l) => !l.match(/^[+-]+$/))
+    const headers: string[] = []
+    const allRows: string[][] = []
 
-  for (let i = 0; i < tableLines.length; i++) {
-    const cells = tableLines[i]
-      .split('|')
-      .map((c) => c.trim())
-      .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1)
-    const altCells = tableLines[i]
-      .split('|')
-      .map((c) => c.trim())
-      .filter((c) => c !== '')
-    const finalCells = cells.length >= altCells.length ? cells : altCells
-    if (finalCells.length === 0) continue
+    for (let i = 0; i < tableLines.length; i++) {
+      const cells = tableLines[i]
+        .split('|').map((c) => c.trim())
+        .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1)
+      const altCells = tableLines[i]
+        .split('|').map((c) => c.trim())
+        .filter((c) => c !== '')
+      const finalCells = cells.length >= altCells.length ? cells : altCells
+      if (finalCells.length === 0) continue
+      // Skip summary lines like "(1 rows)"
+      if (finalCells.length === 1 && /^\(\d+/.test(finalCells[0])) continue
 
-    if (headers.length === 0) {
-      // Strip table prefix from headers (e.g., "student.id" → "id")
-      headers.push(...finalCells.map((h) => { const dot = h.lastIndexOf('.'); return dot >= 0 ? h.slice(dot + 1) : h }))
-    } else {
-      const isSep = finalCells.every((c) => /^[-=]+$/.test(c))
-      if (!isSep && finalCells.length === headers.length) {
-        allRows.push(finalCells)
-      } else if (!isSep && finalCells.length > 0) {
-        const row = finalCells.slice(0, headers.length)
-        while (row.length < headers.length) row.push('')
-        allRows.push(row)
+      if (headers.length === 0) {
+        headers.push(...finalCells.map((h) => { const dot = h.lastIndexOf('.'); return dot >= 0 ? h.slice(dot + 1) : h }))
+      } else {
+        const isSep = finalCells.every((c) => /^[-=]+$/.test(c))
+        if (!isSep && finalCells.length === headers.length) {
+          allRows.push(finalCells)
+        } else if (!isSep && finalCells.length > 0) {
+          const row = finalCells.slice(0, headers.length)
+          while (row.length < headers.length) row.push('')
+          allRows.push(row)
+        }
       }
     }
+    if (headers.length > 0) return { headers, rows: allRows }
   }
-  if (headers.length === 0) return null
-  return { headers, rows: allRows }
+
+  // Fallback: only when backend says it's a table type (not info/error)
+  // Single-column output like "id\n1\n2\n(2 rows)\n" has no pipes
+  if (!isTableType) return null
+  const summaryIdx = rawLines.findIndex((l) => /^\(\d+\s+(rows?|columns?)\)/.test(l))
+  const dataLines = summaryIdx >= 0 ? rawLines.slice(0, summaryIdx) : rawLines
+
+  if (dataLines.length < 1) return null
+  const header = dataLines[0]
+  // Strip table prefix if any (e.g. "student.id" → "id")
+  const dot = header.lastIndexOf('.')
+  const cleanHeader = dot >= 0 ? header.slice(dot + 1) : header
+  const dataRows = dataLines.slice(1).map((l) => [l])
+
+  return { headers: [cleanHeader], rows: dataRows }
 }
 
 export default function DataGrid({ result, token: _token, isDark, tableName, onExecute }: Props) {
@@ -69,7 +79,11 @@ export default function DataGrid({ result, token: _token, isDark, tableName, onE
   const [addingRow, setAddingRow] = useState(false)
   const [newRowValues, setNewRowValues] = useState<string[]>([])
 
-  const table = useMemo(() => (result?.message ? parseTableOutput(result.message) : null), [result])
+  const table = useMemo(() => {
+    if (!result?.message) return null
+    // Only try to parse as table when backend reports type "table"
+    return parseTableOutput(result.message, result.type === 'table')
+  }, [result])
   const canEdit = !!tableName
 
   const handleDoubleClick = useCallback(
