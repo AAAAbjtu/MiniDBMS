@@ -45,6 +45,50 @@ SHOW GRANTS FOR user1;
 SHOW AUDIT LOG;
 ```
 
+## 编译 / Build
+
+### 依赖
+
+- CMake 3.15+
+- C++17 编译器 (MSVC 2019+ / GCC 8+ / Clang 8+)
+- Node.js 18+ + npm（仅前端）
+
+CMake 会自动拉取两个 header-only 依赖：
+
+- [cpp-httplib](https://github.com/yhirose/cpp-httplib) — HTTP 服务器
+- [nlohmann/json](https://github.com/nlohmann/json) — JSON 解析
+
+### C++ 后端
+
+```bash
+# 在项目根目录
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+# 产物: build/MiniDB.exe (或 build/MiniDB)
+```
+
+### 前端（Web GUI）
+
+```bash
+cd frontend
+npm install
+npm run build
+# 产物: build/web/ (自动写入)
+```
+
+> 开发时 `npm run dev` 启动 Vite 热更新，API 代理到后端 3000 端口。
+
+### 一键构建
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+cd frontend && npm install && npm run build && cd ..
+# Release 目录 = build/MiniDB.exe + build/web/
+```
+
+---
+
 ## Web GUI / Web 界面
 
 启动 Web 服务器模式，通过浏览器操作数据库：
