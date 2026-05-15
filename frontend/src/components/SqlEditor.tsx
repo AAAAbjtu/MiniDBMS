@@ -10,7 +10,7 @@ interface Props {
 }
 
 export default function SqlEditor({ onExecute, executing, isDark }: Props) {
-  const [value, setValue] = useState('SELECT 1;')
+  const [value, setValue] = useState('SHOW TABLES;')
   const editorRef = useRef<ReactCodeMirrorRef>(null)
 
   const handleExecute = useCallback(() => {

@@ -202,6 +202,7 @@ export default function Dashboard({ token, onLogout }: Props) {
             <Sidebar
               token={token}
               isDark={isDark}
+              onTableClick={(_db, table) => { setSelectedTable(table) }}
               onSelectTable={(db, table) => { setSchemaDb(db); setSchemaTable(table); setSelectedTable(table); setActiveTab('table') }}
             />
           </div>
