@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { api } from '../lib/api'
 import Sidebar from './Sidebar'
 import SqlEditor from './SqlEditor'
@@ -63,6 +63,16 @@ export default function Dashboard({ token, onLogout }: Props) {
   const [schemaTable, setSchemaTable] = useState('')
   const [selectedTable, setSelectedTable] = useState('')
   const [modalAction, setModalAction] = useState<ModalAction>(null)
+
+  // Fetch current user/db on mount (covers both login and page refresh)
+  useEffect(() => {
+    api.post('/status', { token }).then(({ data }) => {
+      if (data.success) {
+        if (data.currentUser) setCurrentUser(data.currentUser)
+        if (data.currentDb) setCurrentDb(data.currentDb)
+      }
+    }).catch(() => {})
+  }, [token])
 
   const executeSql = useCallback(async (sql: string) => {
     setExecuting(true)

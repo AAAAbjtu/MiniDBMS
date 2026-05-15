@@ -3,7 +3,7 @@ import { api } from '../lib/api'
 import { Database, Loader2, LogIn } from 'lucide-react'
 
 interface Props {
-  onLogin: (token: string) => void
+  onLogin: (token: string, user: string, db: string) => void
 }
 
 export default function AuthView({ onLogin }: Props) {
@@ -23,7 +23,7 @@ export default function AuthView({ onLogin }: Props) {
     try {
       const { data } = await api.post('/login', { username: username.trim(), password })
       if (data.success && data.token) {
-        onLogin(data.token)
+        onLogin(data.token, data.currentUser || '', data.currentDb || '')
       } else {
         setError(data.message || 'Login failed.')
       }

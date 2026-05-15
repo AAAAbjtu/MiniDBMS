@@ -330,9 +330,23 @@ export default function TableWorkspace({ token, isDark, currentDb, initialDb, in
             )}
           </div>
 
+          {/* Add row action bar */}
+          {addingRow && (
+            <div className={`flex items-center gap-2 px-4 py-1.5 border-b shrink-0 ${border} ${isDark ? 'bg-indigo-500/10' : 'bg-indigo-50'}`}>
+              <span className={`text-xs ${muted}`}>New row</span>
+              <div className="flex-1" />
+              <button onClick={saveNewRow} className="flex items-center gap-1 px-3 py-1 text-xs font-medium rounded-lg bg-emerald-500 hover:bg-emerald-400 text-white transition-colors shadow-sm">
+                <Save className="w-3 h-3" /> Save
+              </button>
+              <button onClick={cancelAddRow} className="flex items-center gap-1 px-3 py-1 text-xs font-medium rounded-lg hover:bg-white/10 transition-colors">
+                <X className="w-3 h-3" /> Cancel
+              </button>
+            </div>
+          )}
+
           {/* Table */}
           <div className="flex-1 overflow-auto">
-            <table className="w-full border-collapse table-fixed">
+            <table className="w-full border-collapse table-fixed" style={{ borderCollapse: 'collapse' }}>
               <thead className={`sticky top-0 z-10 ${isDark ? 'bg-slate-800/50' : 'bg-slate-100'}`}>
                 <tr>
                   <th className={`w-10 px-2 py-2 border-r border-b text-left text-[10px] font-medium ${muted} ${border}`}></th>
@@ -383,7 +397,7 @@ export default function TableWorkspace({ token, isDark, currentDb, initialDb, in
                       </div>
                     </th>
                   )}
-                  <th className={`w-8 border-r border-b border-transparent`} />
+                  <th className="w-8 border-r border-b border-transparent" />
                 </tr>
               </thead>
               <tbody>
@@ -425,12 +439,7 @@ export default function TableWorkspace({ token, isDark, currentDb, initialDb, in
                         <input type="text" value={newRow[colIdx] ?? ''} onChange={(e) => setNewRow((prev) => { const n = [...prev]; n[colIdx] = e.target.value; return n })} placeholder="value" className={`w-full ${inputClass}`} autoFocus={colIdx === 0} onKeyDown={(e) => { if (e.key === 'Enter') saveNewRow(); if (e.key === 'Escape') cancelAddRow() }} />
                       </td>
                     ))}
-                    <td className="w-8 px-1 py-1.5 border-b border-transparent">
-                      <div className="flex items-center gap-0.5">
-                        <button onClick={saveNewRow} className="p-0.5 rounded text-emerald-400 hover:bg-emerald-500/10" title="Save"><Save className="w-3.5 h-3.5" /></button>
-                        <button onClick={cancelAddRow} className="p-0.5 rounded text-red-400 hover:bg-red-500/10" title="Cancel"><X className="w-3.5 h-3.5" /></button>
-                      </div>
-                    </td>
+                    <td className="w-8 px-1 py-1.5 border-b border-transparent"></td>
                   </tr>
                 )}
               </tbody>

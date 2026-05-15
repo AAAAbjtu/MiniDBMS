@@ -5,7 +5,7 @@ import Dashboard from './components/Dashboard'
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('minidb_token'))
 
-  const handleLogin = (newToken: string) => {
+  const handleLogin = (newToken: string, _user: string, _db: string) => {
     localStorage.setItem('minidb_token', newToken)
     setToken(newToken)
   }
